@@ -1,0 +1,27 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Streamlit and local runtime artifacts
+.streamlit/
+
+# Local database and temporary outputs
+project_inventory.db
+project_inventory.db-*
+*.log
+
+# Test and type-checker caches
+.pytest_cache/
+.mypy_cache/
+
+# OS/editor files
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
