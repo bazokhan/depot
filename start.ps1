@@ -6,6 +6,8 @@ Set-Location -LiteralPath $scriptDir
 
 $venvPath = Join-Path $scriptDir ".venv"
 $activatePath = Join-Path $venvPath "Scripts\Activate.ps1"
+$venvPythonPath = Join-Path $venvPath "Scripts\python.exe"
+$venvPipPath = Join-Path $venvPath "Scripts\pip.exe"
 $requirementsPath = Join-Path $scriptDir "requirements-dashboard.txt"
 $dashboardScript = Join-Path $scriptDir "project_inventory_dashboard.py"
 
@@ -17,9 +19,46 @@ if (-not (Test-Path -LiteralPath $requirementsPath)) {
     throw "Missing requirements file: $requirementsPath"
 }
 
-if (-not (Test-Path -LiteralPath $activatePath)) {
-    Write-Host "Creating virtual environment in .venv ..." -ForegroundColor Cyan
-    python -m venv $venvPath
+function New-CleanVenv {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (Test-Path -LiteralPath $Path) {
+        Write-Host "Rebuilding virtual environment (detected moved/broken .venv) ..." -ForegroundColor Yellow
+        Remove-Item -Recurse -Force -LiteralPath $Path
+    }
+    else {
+        Write-Host "Creating virtual environment in .venv ..." -ForegroundColor Cyan
+    }
+
+    python -m venv $Path
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to create virtual environment at: $Path"
+    }
+}
+
+$venvNeedsRebuild = $false
+if (-not (Test-Path -LiteralPath $activatePath) -or -not (Test-Path -LiteralPath $venvPythonPath)) {
+    $venvNeedsRebuild = $true
+}
+else {
+    & $venvPythonPath -m pip --version *> $null
+    if ($LASTEXITCODE -ne 0) {
+        $venvNeedsRebuild = $true
+    }
+
+    if (-not $venvNeedsRebuild -and (Test-Path -LiteralPath $venvPipPath)) {
+        & $venvPipPath --version *> $null
+        if ($LASTEXITCODE -ne 0) {
+            $venvNeedsRebuild = $true
+        }
+    }
+}
+
+if ($venvNeedsRebuild) {
+    New-CleanVenv -Path $venvPath
 }
 
 . $activatePath
@@ -31,4 +70,4 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Starting dashboard ..." -ForegroundColor Green
-streamlit run $dashboardScript
+python -m streamlit run $dashboardScript
