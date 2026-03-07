@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"D:/LocalRepos/rpg-puzzle/.gitignore\":*)",
+      "Bash(git:*)"
+    ]
+  }
+}

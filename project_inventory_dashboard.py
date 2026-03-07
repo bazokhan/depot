@@ -2,6 +2,7 @@ import ctypes
 import hashlib
 import json
 import os
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -16,12 +17,14 @@ import streamlit as st
 
 
 DB_PATH = Path(__file__).with_name("project_inventory.db")
-DEFAULT_ROOTS = [r"D:\OneDrive\projects", r"D:\projects"]
+CONFIG_PATH = Path(__file__).with_name("project_inventory_config.json")
 
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".csv", ".log",
     ".py", ".ps1", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".scss",
     ".java", ".c", ".cpp", ".h", ".hpp", ".cs", ".go", ".rs", ".rb", ".php", ".sql", ".sh",
+    ".rst", ".xml", ".env", ".htaccess", ".gitignore", ".dockerignore", ".editorconfig",
+    ".bat", ".cmd", ".lock",
 }
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico"}
 
@@ -51,12 +54,45 @@ MARKER_FILES = {
     "vite.config.js": "Vite",
 }
 
+FILE_ICONS: Dict[str, str] = {
+    ".py": "🐍", ".ipynb": "🐍",
+    ".js": "📜", ".jsx": "⚛️", ".mjs": "📜", ".cjs": "📜",
+    ".ts": "📘", ".tsx": "⚛️",
+    ".json": "📋", ".jsonc": "📋",
+    ".yaml": "⚙️", ".yml": "⚙️",
+    ".toml": "⚙️", ".ini": "⚙️", ".cfg": "⚙️", ".conf": "⚙️",
+    ".md": "📝", ".mdx": "📝", ".txt": "📄", ".rst": "📄",
+    ".html": "🌐", ".htm": "🌐",
+    ".css": "🎨", ".scss": "🎨", ".sass": "🎨", ".less": "🎨",
+    ".env": "🔐", ".env.local": "🔐", ".env.example": "🔐",
+    ".sh": "⚡", ".bash": "⚡", ".zsh": "⚡", ".bat": "⚡", ".cmd": "⚡", ".ps1": "⚡",
+    ".png": "🖼️", ".jpg": "🖼️", ".jpeg": "🖼️", ".gif": "🖼️",
+    ".svg": "🎭", ".ico": "🖼️", ".webp": "🖼️", ".bmp": "🖼️",
+    ".mp4": "🎬", ".mov": "🎬", ".avi": "🎬", ".webm": "🎬",
+    ".mp3": "🎵", ".wav": "🎵", ".ogg": "🎵",
+    ".pdf": "📕", ".docx": "📘", ".doc": "📘", ".xlsx": "📗", ".xls": "📗", ".pptx": "📙",
+    ".zip": "🗜️", ".tar": "🗜️", ".gz": "🗜️", ".7z": "🗜️", ".rar": "🗜️",
+    ".sql": "🗄️", ".db": "🗄️", ".sqlite": "🗄️", ".sqlite3": "🗄️",
+    ".rs": "🦀", ".go": "🔵", ".java": "☕", ".kt": "☕",
+    ".cpp": "⚙️", ".c": "⚙️", ".h": "⚙️", ".hpp": "⚙️",
+    ".cs": "💜", ".rb": "💎", ".php": "🐘", ".dart": "🎯", ".swift": "🍎",
+    ".lock": "🔒",
+    ".gitignore": "🚫", ".dockerignore": "🚫",
+    ".xml": "📋", ".plist": "📋",
+}
+FOLDER_ICON = "📁"
+DEFAULT_FILE_ICON = "📄"
+
 FILE_ATTRIBUTE_OFFLINE = 0x1000
 FILE_ATTRIBUTE_PINNED = 0x00080000
 FILE_ATTRIBUTE_UNPINNED = 0x00100000
 FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x00040000
 FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
 
+
+# ---------------------------------------------------------------------------
+# Generic utilities
+# ---------------------------------------------------------------------------
 
 def format_bytes(num: Optional[int]) -> str:
     if num is None:
@@ -109,7 +145,6 @@ def pick_folder(initial_dir: str = r"D:\\") -> Optional[str]:
     try:
         import tkinter as tk
         from tkinter import filedialog
-
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
@@ -153,7 +188,10 @@ def get_allocated_size(path: str) -> Optional[int]:
 
 def run_git(project_path: str, args: List[str]) -> Optional[str]:
     try:
-        result = subprocess.run(["git", "-C", project_path] + args, capture_output=True, text=True, timeout=6, check=False)
+        result = subprocess.run(
+            ["git", "-C", project_path] + args,
+            capture_output=True, text=True, timeout=6, check=False,
+        )
         if result.returncode != 0:
             return None
         return result.stdout.strip() or None
@@ -191,6 +229,119 @@ def build_signature(file_samples: List[Tuple[str, int]]) -> str:
         digest.update(b"\x00")
     return digest.hexdigest()
 
+
+def get_file_icon(filename: str) -> str:
+    name_lower = filename.lower()
+    if name_lower in ("dockerfile",):
+        return "🐳"
+    suffix = Path(filename).suffix.lower()
+    return FILE_ICONS.get(suffix, DEFAULT_FILE_ICON)
+
+
+# ---------------------------------------------------------------------------
+# Package manifest parsers
+# ---------------------------------------------------------------------------
+
+def parse_package_json(project_path: str) -> Optional[dict]:
+    pkg_path = Path(project_path) / "package.json"
+    if not pkg_path.exists():
+        return None
+    try:
+        data = json.loads(pkg_path.read_text(encoding="utf-8", errors="replace"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def parse_pyproject_toml(project_path: str) -> Optional[dict]:
+    path = Path(project_path) / "pyproject.toml"
+    if not path.exists():
+        return None
+    try:
+        try:
+            import tomllib  # Python 3.11+
+        except ImportError:
+            try:
+                import tomli as tomllib  # type: ignore[no-redef]
+            except ImportError:
+                return None
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except Exception:
+        return None
+
+
+def read_requirements_txt(project_path: str) -> Optional[List[str]]:
+    req_path = Path(project_path) / "requirements.txt"
+    if not req_path.exists():
+        return None
+    try:
+        lines = [
+            ln.strip() for ln in req_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        return lines
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# index.html + live server
+# ---------------------------------------------------------------------------
+
+def find_index_html(project_path: str) -> Optional[Path]:
+    for name in ("index.html", "index.htm", "Index.html"):
+        p = Path(project_path) / name
+        if p.exists() and p.is_file():
+            return p
+    return None
+
+
+def _find_free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def get_live_server_state(project_path: str) -> Optional[dict]:
+    key = f"live_server::{project_path}"
+    state = st.session_state.get(key)
+    if state:
+        proc = state.get("process")
+        if proc and proc.poll() is None:
+            return state
+        del st.session_state[key]
+    return None
+
+
+def start_live_server(project_path: str) -> int:
+    state = get_live_server_state(project_path)
+    if state:
+        return state["port"]
+    port = _find_free_port()
+    proc = subprocess.Popen(
+        ["python", "-m", "http.server", str(port), "--bind", "127.0.0.1"],
+        cwd=project_path,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    key = f"live_server::{project_path}"
+    st.session_state[key] = {"process": proc, "port": port}
+    return port
+
+
+def stop_live_server(project_path: str) -> None:
+    key = f"live_server::{project_path}"
+    state = st.session_state.pop(key, None)
+    if state:
+        proc = state.get("process")
+        if proc:
+            proc.terminate()
+
+
+# ---------------------------------------------------------------------------
+# Scanner
+# ---------------------------------------------------------------------------
 
 def scan_project(project_path: str, source_root: str) -> Dict[str, object]:
     project_name = os.path.basename(project_path)
@@ -307,6 +458,10 @@ def scan_project(project_path: str, source_root: str) -> Dict[str, object]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
 def initialize_db(db_path: Path) -> None:
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -392,7 +547,6 @@ def scan_roots(roots: List[str]) -> List[Dict[str, object]]:
     if not projects:
         progress.empty()
         return rows
-
     for idx, (project_path, source_root) in enumerate(projects, start=1):
         progress.progress(idx / len(projects), text=f"Scanning {idx}/{len(projects)}: {project_path}")
         rows.append(scan_project(project_path, source_root))
@@ -400,47 +554,108 @@ def scan_roots(roots: List[str]) -> List[Dict[str, object]]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Config persistence (roots survive server restarts)
+# ---------------------------------------------------------------------------
+
+def _load_saved_roots() -> List[str]:
+    if CONFIG_PATH.exists():
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            roots = data.get("scan_roots", [])
+            if isinstance(roots, list):
+                return [str(r) for r in roots]
+        except Exception:
+            pass
+    return []
+
+
+def _save_roots(roots: List[str]) -> None:
+    try:
+        CONFIG_PATH.write_text(
+            json.dumps({"scan_roots": roots}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Sidebar scan controls
+# ---------------------------------------------------------------------------
+
 def render_root_editor() -> Tuple[bool, List[str]]:
     st.header("Scan Controls")
+
     if "scan_roots_list" not in st.session_state:
-        st.session_state["scan_roots_list"] = [r for r in DEFAULT_ROOTS if os.path.isdir(r)] or DEFAULT_ROOTS[:1]
+        st.session_state["scan_roots_list"] = _load_saved_roots()
+
     roots = list(st.session_state["scan_roots_list"])
 
-    st.caption("Add one or many roots. Paths can be typed manually or selected with Browse.")
+    # Apply any value queued by a Browse pick BEFORE widgets are instantiated.
+    # (Streamlit forbids setting a widget's key after the widget is created.)
+    pending = st.session_state.pop("_pending_root_update", None)
+    if pending is not None:
+        p_idx, p_val = pending
+        st.session_state[f"scan_root_{p_idx}"] = p_val  # safe: widget not yet created
+
+    st.caption("Paths are saved to disk and persist across restarts.")
     remove_index = None
     for idx in range(len(roots)):
-        cols = st.columns([7, 1.4, 1.2])
-        roots[idx] = cols[0].text_input(f"Root {idx + 1}", value=roots[idx], key=f"scan_root_{idx}")
-        if cols[1].button("Browse", key=f"browse_{idx}", use_container_width=True):
-            chosen = pick_folder(roots[idx] or r"D:\\")
+        widget_key = f"scan_root_{idx}"
+        cols = st.columns([7, 1, 1])
+        roots[idx] = cols[0].text_input(
+            f"Root {idx + 1}", value=roots[idx], key=widget_key,
+            label_visibility="collapsed",
+            placeholder=f"Root {idx + 1} — paste or browse",
+        )
+        if cols[1].button("📂", key=f"browse_{idx}", use_container_width=True, help="Browse for folder"):
+            chosen = pick_folder(roots[idx] if roots[idx].strip() else r"C:\\")
             if chosen:
                 roots[idx] = chosen
                 st.session_state["scan_roots_list"] = roots
+                # Queue the widget value update for the next render cycle
+                st.session_state["_pending_root_update"] = (idx, chosen)
+                _save_roots(roots)
                 st.rerun()
-        if cols[2].button("Remove", key=f"remove_{idx}", use_container_width=True, disabled=len(roots) == 1):
+
+        if cols[2].button("✕", key=f"remove_{idx}", use_container_width=True, help="Remove this root"):
             remove_index = idx
 
-    if remove_index is not None and len(roots) > 1:
+    if remove_index is not None:
         roots.pop(remove_index)
+        # Clear widget keys from the removed index onward so they re-render
+        # with correct values (keys shift down after removal)
+        for i in range(remove_index, len(roots) + 1):
+            st.session_state.pop(f"scan_root_{i}", None)
         st.session_state["scan_roots_list"] = roots
+        _save_roots(roots)
         st.rerun()
 
-    if st.button("Add another root", use_container_width=True):
+    if st.button("+ Add root", use_container_width=True):
         roots.append("")
         st.session_state["scan_roots_list"] = roots
+        _save_roots(roots)
         st.rerun()
 
+    # Persist any manual edits made in the text inputs this render cycle
     st.session_state["scan_roots_list"] = roots
-    valid = [r.strip() for r in roots if r.strip()]
-    if not valid:
-        st.warning("Add at least one root path.")
-    st.caption("The scan checks immediate child folders under each root, recursively.")
-    return st.button("Run Full Scan", type="primary", use_container_width=True), valid
+    _save_roots(roots)
 
+    valid = [r.strip() for r in roots if r.strip()]
+    if not roots:
+        st.info("No roots configured. Add a folder path and run a scan.")
+    elif not valid:
+        st.warning("Enter at least one valid path.")
+    st.caption("Scans immediate child folders under each root.")
+    return st.button("Run Full Scan", type="primary", use_container_width=True, disabled=not valid), valid
+
+
+# ---------------------------------------------------------------------------
+# Inventory table
+# ---------------------------------------------------------------------------
 
 def apply_inventory_filters(df: pd.DataFrame) -> pd.DataFrame:
-    st.subheader("Project Inventory")
-
     c1, c2, c3, c4 = st.columns([2.2, 1, 1, 1])
     search_text = c1.text_input("Search name/path", "")
     source_options = sorted(df["source_root"].dropna().unique().tolist())
@@ -485,7 +700,6 @@ def apply_inventory_filters(df: pd.DataFrame) -> pd.DataFrame:
 
     name_counts = view.groupby("project_name")["project_path"].count().to_dict()
     view["in_multiple_roots"] = view["project_name"].map(lambda n: 1 if name_counts.get(n, 0) > 1 else 0)
-
     return view
 
 
@@ -500,12 +714,13 @@ def render_inventory(df: pd.DataFrame) -> pd.DataFrame:
     col_c.metric("With Remote", f"{int(df['has_remote'].sum())}")
     col_d.metric("Empty", f"{int(df['is_empty'].sum())}")
 
+    st.subheader("Project Inventory")
+    st.caption("Click a row to select a project for the drilldown below.")
     view = apply_inventory_filters(df)
     table = view.copy()
     table["Git"] = table["has_git_tree"].map(lambda v: bool_icon(v, "🌿", "—"))
     table["Remote"] = table["has_remote"].map(lambda v: bool_icon(v, "☁️", "—"))
     table["Remote URL"] = table["remote_url"].map(remote_to_web_url)
-    table["Open folder"] = table["project_path"].map(path_to_file_url)
     table["Empty"] = table["is_empty"].map(lambda v: bool_icon(v, "📭", "—"))
     table["Both roots"] = table["in_multiple_roots"].map(lambda v: bool_icon(v, "🔁", "—"))
     table["Duplicates"] = table["duplicate_group_size"].map(lambda n: "🧬" if int(n) > 1 else "—")
@@ -515,43 +730,116 @@ def render_inventory(df: pd.DataFrame) -> pd.DataFrame:
 
     show = table[
         [
-            "project_name", "source_root", "Open folder", "Git", "Remote", "remote_owner", "Remote URL", "Empty", "Both roots", "Duplicates",
-            "total_files", "total_dirs", "Logical size", "On-disk size", "last_commit_date",
+            "project_name", "source_root", "Git", "Remote", "remote_owner", "Remote URL",
+            "Empty", "Both roots", "Duplicates", "total_files", "total_dirs",
+            "Logical size", "On-disk size", "last_commit_date",
             "last_file_modified_utc", "top_languages", "framework_hints", "Errors", "project_path",
         ]
     ].rename(
         columns={
             "project_name": "Project",
             "source_root": "Root",
-            "remote_owner": "Remote owner",
+            "remote_owner": "Owner",
             "total_files": "Files",
             "total_dirs": "Folders",
             "last_commit_date": "Last commit",
             "last_file_modified_utc": "Last file update",
             "top_languages": "Languages",
-            "framework_hints": "Framework hints",
+            "framework_hints": "Frameworks",
             "project_path": "Path",
         }
     )
 
-    st.dataframe(
+    event = st.dataframe(
         show,
         use_container_width=True,
         hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="projects_table",
         column_config={
             "Project": st.column_config.TextColumn(width="medium"),
             "Root": st.column_config.TextColumn(width="medium"),
             "Path": st.column_config.TextColumn(width="large"),
-            "Open folder": st.column_config.LinkColumn(width="small", display_text="📂 Open"),
             "Remote URL": st.column_config.LinkColumn(width="large"),
-            "Remote owner": st.column_config.TextColumn(width="medium"),
+            "Owner": st.column_config.TextColumn(width="small"),
             "Files": st.column_config.NumberColumn(format="%d"),
             "Folders": st.column_config.NumberColumn(format="%d"),
         },
     )
     st.caption(f"Rows shown: {len(show)}")
+
+    if event.selection.rows:
+        clicked_path = show.iloc[event.selection.rows[0]]["Path"]
+        st.session_state["selected_project_path"] = clicked_path
+        st.session_state["active_tab"] = "project"
+        st.rerun()
+
     return view
 
+
+# ---------------------------------------------------------------------------
+# File tree HTML renderer
+# ---------------------------------------------------------------------------
+
+def render_file_tree_html(current_path: str, project_path: str, selected_file: str = "") -> str:
+    root_name = os.path.basename(project_path)
+    try:
+        rel = os.path.relpath(current_path, project_path)
+        display_path = root_name if rel == "." else f"{root_name}/{rel.replace(chr(92), '/')}"
+    except ValueError:
+        display_path = root_name
+
+    lines = [
+        '<div style="font-family:Consolas,monospace;font-size:12.5px;'
+        "background:#1e1e2e;color:#cdd6f4;padding:10px 8px;border-radius:6px;"
+        'height:360px;overflow-y:auto;line-height:1.8;user-select:none;">',
+        f'<div style="color:#89b4fa;font-weight:bold;margin-bottom:4px;">📂 {display_path}/</div>',
+    ]
+
+    try:
+        folders: List[str] = []
+        files: List[str] = []
+        with os.scandir(current_path) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        folders.append(entry.name)
+                    else:
+                        files.append(entry.name)
+                except Exception:
+                    pass
+        folders.sort(key=str.lower)
+        files.sort(key=str.lower)
+
+        for name in folders[:60]:
+            lines.append(
+                f'<div style="padding-left:14px;color:#89b4fa;">'
+                f'📁 {name}/</div>'
+            )
+        for name in files[:120]:
+            icon = get_file_icon(name)
+            full = os.path.join(current_path, name)
+            is_sel = full == selected_file
+            bg = "background:#313244;border-radius:3px;" if is_sel else ""
+            color = "#a6e3a1" if is_sel else "#cdd6f4"
+            lines.append(
+                f'<div style="padding-left:14px;color:{color};{bg}">'
+                f'{icon} {name}</div>'
+            )
+        total = len(folders) + len(files)
+        if total > 180:
+            lines.append('<div style="color:#6c7086;padding-left:14px;">… more files not shown</div>')
+    except Exception as exc:
+        lines.append(f'<div style="color:#f38ba8;">Error reading directory: {exc}</div>')
+
+    lines.append("</div>")
+    return "".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# File explorer panel
+# ---------------------------------------------------------------------------
 
 def list_folder_entries(path: str) -> Tuple[List[os.DirEntry], List[os.DirEntry], List[str]]:
     folders: List[os.DirEntry] = []
@@ -575,12 +863,10 @@ def list_folder_entries(path: str) -> Tuple[List[os.DirEntry], List[os.DirEntry]
 
 
 def render_file_preview(file_path: str) -> None:
-    st.markdown("### File Preview (Read-Only)")
     try:
         st_info = os.stat(file_path)
         attrs = getattr(st_info, "st_file_attributes", 0)
-        st.caption(f"`{file_path}`")
-        st.caption(f"Size: {format_bytes(st_info.st_size)} | State: {file_state_from_attrs(attrs)}")
+        st.caption(f"`{file_path}`  |  {format_bytes(st_info.st_size)}  |  {file_state_from_attrs(attrs)}")
     except Exception as exc:
         st.error(f"Could not stat file: {exc}")
         return
@@ -593,20 +879,315 @@ def render_file_preview(file_path: str) -> None:
         st.info("Binary or unsupported preview type.")
         return
     if st_info.st_size > 2 * 1024 * 1024:
-        st.info("File larger than 2MB. Preview skipped for responsiveness.")
+        st.info("File larger than 2 MB — preview skipped.")
         return
 
     try:
         content = Path(file_path).read_text(encoding="utf-8", errors="replace")
     except Exception as exc:
-        st.error(f"Could not read file content: {exc}")
+        st.error(f"Could not read file: {exc}")
         return
 
     if suffix == ".md":
         st.markdown(content)
     else:
-        st.code(content)
+        lang_map = {
+            ".py": "python", ".js": "javascript", ".ts": "typescript",
+            ".tsx": "tsx", ".jsx": "jsx", ".json": "json", ".html": "html",
+            ".css": "css", ".scss": "scss", ".yaml": "yaml", ".yml": "yaml",
+            ".toml": "toml", ".sh": "bash", ".ps1": "powershell",
+            ".sql": "sql", ".rs": "rust", ".go": "go", ".java": "java",
+            ".cs": "csharp", ".cpp": "cpp", ".c": "c",
+        }
+        st.code(content, language=lang_map.get(suffix, "text"))
 
+
+def render_explorer(project_path: str) -> None:
+    nav_key = f"nav::{project_path}"
+    preview_key = f"preview::{project_path}"
+
+    if nav_key not in st.session_state:
+        st.session_state[nav_key] = project_path
+    if preview_key not in st.session_state:
+        st.session_state[preview_key] = None
+
+    current_path = st.session_state[nav_key]
+    selected_file = st.session_state[preview_key]
+
+    # Guard: stay inside project root
+    try:
+        if not os.path.isdir(current_path) or not os.path.abspath(current_path).startswith(os.path.abspath(project_path)):
+            st.session_state[nav_key] = project_path
+            current_path = project_path
+    except Exception:
+        st.session_state[nav_key] = project_path
+        current_path = project_path
+
+    # Breadcrumb + Up
+    bc1, bc2 = st.columns([1, 9])
+    with bc1:
+        up_disabled = current_path == project_path
+        if st.button("⬆ Up", disabled=up_disabled, use_container_width=True, key=f"up::{project_path}"):
+            st.session_state[nav_key] = os.path.dirname(current_path)
+            st.session_state[preview_key] = None
+            st.rerun()
+    with bc2:
+        try:
+            rel = os.path.relpath(current_path, project_path)
+            display = "." if rel == "." else rel.replace("\\", "/")
+        except ValueError:
+            display = current_path
+        st.markdown(
+            f'<div style="font-family:Consolas,monospace;font-size:13px;'
+            f'background:#1e1e2e;color:#89b4fa;padding:6px 10px;border-radius:4px;">'
+            f'📂 {os.path.basename(project_path)} / {display}</div>',
+            unsafe_allow_html=True,
+        )
+
+    folders, files, errors = list_folder_entries(current_path)
+    if errors:
+        st.warning("Some entries could not be read.")
+
+    tree_col, preview_col = st.columns([1, 2])
+
+    with tree_col:
+        # Visual HTML tree
+        st.markdown(
+            render_file_tree_html(current_path, project_path, selected_file or ""),
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("")
+
+        # Folder navigation
+        if folders:
+            folder_options = [f.path for f in folders[:500]]
+            sel_folder = st.selectbox(
+                "Navigate into folder",
+                folder_options,
+                format_func=lambda p: f"📁 {os.path.basename(p)}",
+                key=f"folder_select::{current_path}",
+            )
+            if st.button("Open folder", key=f"open_folder::{current_path}", use_container_width=True):
+                st.session_state[nav_key] = sel_folder
+                st.session_state[preview_key] = None
+                st.rerun()
+        else:
+            st.caption("No subfolders.")
+
+        st.markdown("---")
+
+        # File selection
+        if files:
+            file_options = [f.path for f in files[:500]]
+            # default to already-selected file if in this dir
+            default_idx = 0
+            if selected_file and selected_file in file_options:
+                default_idx = file_options.index(selected_file)
+
+            sel_file = st.selectbox(
+                "Select file",
+                file_options,
+                index=default_idx,
+                format_func=lambda p: f"{get_file_icon(os.path.basename(p))} {os.path.basename(p)}",
+                key=f"file_select::{current_path}",
+            )
+            fc1, fc2 = st.columns(2)
+            if fc1.button("Preview", key=f"preview_btn::{current_path}", use_container_width=True):
+                st.session_state[preview_key] = sel_file
+                st.rerun()
+            if fc2.button("Open externally", key=f"open_file::{current_path}", use_container_width=True):
+                open_in_explorer(sel_file)
+        else:
+            st.caption("No files in this folder.")
+
+    with preview_col:
+        if selected_file and os.path.isfile(selected_file):
+            fname = os.path.basename(selected_file)
+            icon = get_file_icon(fname)
+            st.markdown(f"**{icon} {fname}**")
+            render_file_preview(selected_file)
+        else:
+            st.markdown(
+                '<div style="color:#6c7086;font-size:13px;padding:40px 0;text-align:center;">'
+                "Select a file and click Preview to see its contents."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Package panel
+# ---------------------------------------------------------------------------
+
+def _render_index_html_section(project_path: str) -> None:
+    index_html = find_index_html(project_path)
+    if not index_html:
+        return
+
+    st.markdown("---")
+    st.markdown("#### 🌐 index.html detected")
+    c1, c2, c3 = st.columns([1, 1, 2])
+
+    if c1.button("Open (file://)", key=f"open_html::{project_path}", use_container_width=True):
+        webbrowser.open(path_to_file_url(str(index_html)), new=2)
+
+    server_state = get_live_server_state(project_path)
+    if server_state:
+        port = server_state["port"]
+        c2.success(f"Live :{port}")
+        if c3.button("Stop server", key=f"stop_srv::{project_path}", use_container_width=True):
+            stop_live_server(project_path)
+            st.rerun()
+        st.markdown(f"[Open http://localhost:{port}](http://localhost:{port})")
+    else:
+        if c2.button("▶ Start live server", key=f"start_srv::{project_path}", use_container_width=True):
+            port = start_live_server(project_path)
+            st.success(f"Server started on port {port}. Click the link below.")
+            st.rerun()
+
+
+def render_package_panel(project_path: str) -> None:
+    found_any = False
+
+    # --- package.json ---
+    pkg = parse_package_json(project_path)
+    if pkg:
+        found_any = True
+        st.markdown("#### 📦 package.json")
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Name", pkg.get("name") or "—")
+        m2.metric("Version", pkg.get("version") or "—")
+
+        author = pkg.get("author", "")
+        if isinstance(author, dict):
+            author = author.get("name", "")
+        m3.metric("Author", str(author) if author else "—")
+        m4.metric("License", str(pkg.get("license") or "—"))
+
+        if pkg.get("description"):
+            st.info(pkg["description"])
+
+        deps = pkg.get("dependencies", {})
+        dev_deps = pkg.get("devDependencies", {})
+        peer_deps = pkg.get("peerDependencies", {})
+
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Dependencies", len(deps))
+        d2.metric("Dev Deps", len(dev_deps))
+        d3.metric("Peer Deps", len(peer_deps))
+
+        if deps:
+            with st.expander(f"Dependencies ({len(deps)})"):
+                for name, ver in sorted(deps.items()):
+                    st.code(f"{name}: {ver}", language=None)
+        if dev_deps:
+            with st.expander(f"Dev Dependencies ({len(dev_deps)})"):
+                for name, ver in sorted(dev_deps.items()):
+                    st.code(f"{name}: {ver}", language=None)
+        if peer_deps:
+            with st.expander(f"Peer Dependencies ({len(peer_deps)})"):
+                for name, ver in sorted(peer_deps.items()):
+                    st.code(f"{name}: {ver}", language=None)
+
+        scripts = pkg.get("scripts", {})
+        if scripts:
+            with st.expander(f"Scripts ({len(scripts)})"):
+                for sname, cmd in scripts.items():
+                    st.code(f"npm run {sname}  →  {cmd}", language=None)
+
+        engines = pkg.get("engines", {})
+        if engines:
+            st.caption("Engines: " + "  |  ".join(f"{k}: {v}" for k, v in engines.items()))
+
+    # --- pyproject.toml ---
+    pyproject = parse_pyproject_toml(project_path)
+    if pyproject:
+        found_any = True
+        st.markdown("#### 🐍 pyproject.toml")
+        meta = pyproject.get("project") or pyproject.get("tool", {}).get("poetry", {})
+        if meta:
+            m1, m2 = st.columns(2)
+            m1.metric("Name", meta.get("name") or "—")
+            m2.metric("Version", meta.get("version") or "—")
+            if meta.get("description"):
+                st.info(meta["description"])
+
+            authors = meta.get("authors", [])
+            if authors:
+                author_str = ", ".join(
+                    a if isinstance(a, str) else a.get("name", str(a)) for a in authors[:3]
+                )
+                st.caption(f"Authors: {author_str}")
+
+            deps = meta.get("dependencies", {})
+            if isinstance(deps, dict):
+                if "python" in deps:
+                    st.caption(f"Python requires: {deps['python']}")
+                    other_deps = {k: v for k, v in deps.items() if k != "python"}
+                else:
+                    other_deps = deps
+                if other_deps:
+                    with st.expander(f"Dependencies ({len(other_deps)})"):
+                        for dname, ver in sorted(other_deps.items()):
+                            st.code(f"{dname}: {ver}", language=None)
+            elif isinstance(deps, list) and deps:
+                with st.expander(f"Dependencies ({len(deps)})"):
+                    for dep in sorted(deps):
+                        st.code(str(dep), language=None)
+
+            dev_deps = (
+                meta.get("dev-dependencies", {})
+                or pyproject.get("tool", {}).get("poetry", {}).get("dev-dependencies", {})
+            )
+            if dev_deps and isinstance(dev_deps, dict):
+                with st.expander(f"Dev Dependencies ({len(dev_deps)})"):
+                    for dname, ver in sorted(dev_deps.items()):
+                        st.code(f"{dname}: {ver}", language=None)
+
+    # --- requirements.txt ---
+    reqs = read_requirements_txt(project_path)
+    if reqs is not None:
+        found_any = True
+        st.markdown("#### 🐍 requirements.txt")
+        st.metric("Requirements", len(reqs))
+        if reqs:
+            with st.expander(f"Packages ({len(reqs)})"):
+                for line in reqs:
+                    st.code(line, language=None)
+
+    # --- Cargo.toml (basic) ---
+    cargo_path = Path(project_path) / "Cargo.toml"
+    if cargo_path.exists():
+        found_any = True
+        st.markdown("#### 🦀 Cargo.toml")
+        try:
+            content = cargo_path.read_text(encoding="utf-8", errors="replace")
+            st.code(content[:1500], language="toml")
+        except Exception:
+            pass
+
+    # --- go.mod (basic) ---
+    go_mod = Path(project_path) / "go.mod"
+    if go_mod.exists():
+        found_any = True
+        st.markdown("#### 🔵 go.mod")
+        try:
+            st.code(go_mod.read_text(encoding="utf-8", errors="replace")[:1000], language="text")
+        except Exception:
+            pass
+
+    if not found_any:
+        st.info("No package manifest found (package.json, pyproject.toml, requirements.txt, Cargo.toml, go.mod).")
+
+    # Always check for index.html
+    _render_index_html_section(project_path)
+
+
+# ---------------------------------------------------------------------------
+# README panel
+# ---------------------------------------------------------------------------
 
 def find_root_readme(project_path: str) -> Optional[Path]:
     candidates = ["README.md", "Readme.md", "readme.md", "README.txt", "readme.txt", "README"]
@@ -617,116 +1198,174 @@ def find_root_readme(project_path: str) -> Optional[Path]:
     return None
 
 
-def render_readme_preview(project_path: str) -> None:
+def render_readme_tab(project_path: str) -> None:
     readme = find_root_readme(project_path)
     if not readme:
         st.info("No README found in this project root.")
         return
 
-    with st.expander("README (root)", expanded=True):
-        st.caption(f"`{readme}`")
-        try:
-            size = readme.stat().st_size
-            if size > 2 * 1024 * 1024:
-                st.info("README is larger than 2MB; preview skipped.")
-                return
-            content = readme.read_text(encoding="utf-8", errors="replace")
-        except Exception as exc:
-            st.error(f"Could not load README: {exc}")
+    st.caption(f"`{readme}`")
+    try:
+        size = readme.stat().st_size
+        if size > 2 * 1024 * 1024:
+            st.info("README is larger than 2 MB; preview skipped.")
             return
+        content = readme.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        st.error(f"Could not load README: {exc}")
+        return
 
-        if readme.suffix.lower() == ".md":
-            st.markdown(content)
-        else:
-            st.code(content)
-
-
-def render_explorer(project_path: str) -> None:
-    st.subheader("Read-Only Explorer")
-    nav_key = f"nav::{project_path}"
-    if nav_key not in st.session_state:
-        st.session_state[nav_key] = project_path
-    current_path = st.session_state[nav_key]
-
-    if not os.path.isdir(current_path) or os.path.commonpath([project_path, current_path]) != project_path:
-        st.session_state[nav_key] = project_path
-        current_path = project_path
-
-    c1, c2 = st.columns([1, 8])
-    with c1:
-        if current_path != project_path and st.button("Up", key=f"up::{project_path}", use_container_width=True):
-            st.session_state[nav_key] = os.path.dirname(current_path)
-            st.rerun()
-    with c2:
-        st.text_input("Current folder", value=current_path, disabled=True, key=f"path::{project_path}")
-
-    folders, files, errors = list_folder_entries(current_path)
-    if errors:
-        st.warning("Some paths could not be read.")
-        for err in errors[:4]:
-            st.caption(err)
-
-    st.markdown("**Folders**")
-    if folders:
-        folder_options = [f.path for f in folders[:500]]
-        selected_folder = st.selectbox(
-            "Subfolders",
-            folder_options,
-            format_func=lambda p: f"📁 {os.path.basename(p)}",
-            key=f"folder_select::{current_path}",
-        )
-        if st.button("Open selected folder", key=f"open_folder::{current_path}"):
-            st.session_state[nav_key] = selected_folder
-            st.rerun()
+    if readme.suffix.lower() == ".md":
+        st.markdown(content)
     else:
-        st.caption("No subfolders.")
+        st.code(content)
 
-    st.markdown("**Files**")
-    if files:
-        file_options = [f.path for f in files[:500]]
-        selected_file = st.selectbox(
-            "Select file to preview",
-            file_options,
-            format_func=lambda p: f"📄 {os.path.basename(p)}",
-            key=f"file_select::{current_path}",
-        )
-        action_cols = st.columns([1, 1, 3])
-        if action_cols[0].button("Open file", key=f"open_file::{current_path}", use_container_width=True):
-            open_in_explorer(selected_file)
-        if action_cols[1].button("Open folder", key=f"open_file_folder::{current_path}", use_container_width=True):
-            open_in_explorer(str(Path(selected_file).parent))
-        render_file_preview(selected_file)
-    else:
-        st.caption("No files.")
 
+# ---------------------------------------------------------------------------
+# README cards (global tab)
+# ---------------------------------------------------------------------------
+
+def render_readme_cards(df: pd.DataFrame) -> None:
+    if df.empty:
+        st.info("No projects in the current view.")
+        return
+
+    st.caption(f"Showing {len(df)} projects. Click a card to open the project view.")
+    cols_per_row = 3
+    projects = df.to_dict("records")
+
+    for i in range(0, len(projects), cols_per_row):
+        row_projects = projects[i:i + cols_per_row]
+        cols = st.columns(cols_per_row)
+        for col, project in zip(cols, row_projects):
+            with col:
+                with st.container(border=True):
+                    name = project["project_name"]
+                    lang = project.get("top_languages") or ""
+                    fw = project.get("framework_hints") or ""
+                    is_git = int(project.get("has_git_tree", 0)) == 1
+                    has_remote = int(project.get("has_remote", 0)) == 1
+
+                    # Header row
+                    badges = []
+                    if is_git:
+                        badges.append("🌿 git")
+                    if has_remote:
+                        badges.append("☁️ remote")
+                    badge_str = "  ".join(badges)
+
+                    st.markdown(f"**{name}**")
+                    if badge_str:
+                        st.caption(badge_str)
+                    if lang:
+                        st.caption(f"🔤 {lang}")
+                    if fw:
+                        st.caption(f"🔧 {fw}")
+
+                    # README snippet
+                    readme = find_root_readme(str(project["project_path"]))
+                    if readme:
+                        try:
+                            content = readme.read_text(encoding="utf-8", errors="replace")
+                            # Strip markdown headings for snippet
+                            lines = [ln for ln in content.splitlines() if ln.strip() and not ln.startswith("#")]
+                            snippet = " ".join(lines)[:280].strip()
+                            if snippet:
+                                st.markdown(
+                                    f'<div style="font-size:12px;color:#888;line-height:1.5;">'
+                                    f'{snippet}{"…" if len(snippet) == 280 else ""}</div>',
+                                    unsafe_allow_html=True,
+                                )
+                            else:
+                                st.caption("_README has no body text_")
+                        except Exception:
+                            st.caption("_Could not read README_")
+                    else:
+                        st.caption("_No README_")
+
+                    st.markdown("")
+                    if st.button("🔍 Open project", key=f"card::{project['project_path']}", use_container_width=True):
+                        st.session_state["selected_project_path"] = str(project["project_path"])
+                        st.session_state["active_tab"] = "project"
+                        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Git panel
+# ---------------------------------------------------------------------------
 
 def render_git_panel(row: pd.Series) -> None:
-    st.subheader("Git Details")
     if int(row["has_git_tree"]) != 1:
         st.info("No git repository detected in this project tree.")
         return
 
-    st.write(f"Remote: `{row.get('remote_url') or '-'}`")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Branch", row.get("default_branch") or "—")
+    m2.metric("Last author", row.get("last_commit_author") or "—")
+    m3.metric("Last commit", (row.get("last_commit_date") or "—")[:10])
+
     remote_web = remote_to_web_url(row.get("remote_url"))
     if remote_web:
-        st.markdown(f"[Open remote repository]({remote_web})")
-        if st.button("Open remote in browser", key=f"open_remote::{row.get('project_path')}"):
+        c1, c2 = st.columns([2, 1])
+        c1.markdown(f"[{remote_web}]({remote_web})")
+        if c2.button("Open in browser", key=f"open_remote::{row.get('project_path')}", use_container_width=True):
             webbrowser.open(remote_web, new=2)
-    st.write(f"Owner: `{row.get('remote_owner') or '-'}`")
-    st.write(f"Branch: `{row.get('default_branch') or '-'}`")
-    st.write(f"Last commit: `{row.get('last_commit_date') or '-'}` by `{row.get('last_commit_author') or '-'}`")
+    elif row.get("remote_url"):
+        st.code(row["remote_url"])
+    else:
+        st.caption("No remote configured.")
 
-    recent = run_git(str(row["project_path"]), ["log", "-5", "--pretty=%h | %ad | %an | %s", "--date=short"])
+    recent = run_git(str(row["project_path"]), ["log", "-10", "--pretty=%h | %ad | %an | %s", "--date=short"])
     if recent:
         st.markdown("**Recent commits**")
-        for line in recent.splitlines():
-            st.code(line)
+        st.code(recent, language=None)
+
+
+# ---------------------------------------------------------------------------
+# Metadata panel
+# ---------------------------------------------------------------------------
+
+def render_metadata_panel(row: pd.Series) -> None:
+    cols = st.columns(2)
+    with cols[0]:
+        st.metric("Total files", row.get("total_files"))
+        st.metric("Total folders", row.get("total_dirs"))
+        st.metric("Logical size", format_bytes(row.get("logical_size_bytes")))
+        st.metric("On-disk size", format_bytes(row.get("allocated_size_bytes")))
+    with cols[1]:
+        st.metric("Git tree", bool_icon(int(row.get("has_git_tree", 0)), "Yes", "No"))
+        st.metric("Remote", bool_icon(int(row.get("has_remote", 0)), "Yes", "No"))
+        st.metric("Empty", bool_icon(int(row.get("is_empty", 0)), "Yes", "No"))
+        st.metric("Scan errors", int(row.get("scan_errors", 0)))
+
+    st.markdown("---")
+    fields = [
+        ("Languages", row.get("top_languages") or "—"),
+        ("Frameworks", row.get("framework_hints") or "—"),
+        ("Extensions", row.get("top_extensions") or "—"),
+        ("Last file update", row.get("last_file_modified_utc") or "—"),
+        ("OneDrive states", row.get("onedrive_states") or "—"),
+        ("Scanned at", row.get("scanned_at_utc") or "—"),
+        ("Root", row.get("source_root") or "—"),
+        ("Path", row.get("project_path") or "—"),
+    ]
+    for label, value in fields:
+        st.markdown(f"**{label}:** `{value}`")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+_NAV_TABLE = "table"
+_NAV_PROJECT = "project"
+_NAV_READMES = "readmes"
 
 
 def main() -> None:
     st.set_page_config(page_title="Project Inventory Dashboard", page_icon="🗂️", layout="wide")
     st.title("🗂️ Project Inventory Dashboard")
-    st.caption("Read-only review workspace for old projects. No delete/move/edit actions are included.")
+    st.caption("Read-only developer companion for managing local repos.")
 
     initialize_db(DB_PATH)
 
@@ -739,44 +1378,102 @@ def main() -> None:
         st.success(f"Scan complete: {len(rows)} projects indexed.")
 
     df = load_projects(DB_PATH)
-    filtered = render_inventory(df)
-    if filtered.empty:
-        return
+
+    if "active_tab" not in st.session_state:
+        st.session_state["active_tab"] = _NAV_TABLE
+
+    active = st.session_state["active_tab"]
+
+    # --- Button-based navigation bar (supports programmatic tab switching) ---
+    selected_path = st.session_state.get("selected_project_path")
+    proj_label = f"🔍 {Path(selected_path).name}" if selected_path else "🔍 Project"
+
+    n1, n2, n3 = st.columns(3)
+    if n1.button(
+        "📋 Table", use_container_width=True,
+        type="primary" if active == _NAV_TABLE else "secondary",
+    ):
+        st.session_state["active_tab"] = _NAV_TABLE
+        st.rerun()
+    if n2.button(
+        proj_label, use_container_width=True,
+        type="primary" if active == _NAV_PROJECT else "secondary",
+    ):
+        st.session_state["active_tab"] = _NAV_PROJECT
+        st.rerun()
+    if n3.button(
+        "📚 READMEs", use_container_width=True,
+        type="primary" if active == _NAV_READMES else "secondary",
+    ):
+        st.session_state["active_tab"] = _NAV_READMES
+        st.rerun()
 
     st.markdown("---")
-    st.subheader("Project Drilldown")
-    selected_path = st.selectbox(
-        "Choose project",
-        filtered["project_path"].tolist(),
-        format_func=lambda p: f"{Path(p).name} ({p})",
-    )
-    selected = filtered[filtered["project_path"] == selected_path].iloc[0]
 
-    left, right = st.columns([2, 1])
-    with left:
-        render_explorer(str(selected["project_path"]))
-    with right:
-        render_readme_preview(str(selected["project_path"]))
-        quick_cols = st.columns([1, 1])
-        if quick_cols[0].button("Open project in Explorer", use_container_width=True):
+    # --- Table view ---
+    if active == _NAV_TABLE:
+        render_inventory(df)
+
+    # --- Project drilldown ---
+    elif active == _NAV_PROJECT:
+        if df.empty:
+            st.warning("No inventory found. Run a scan first.")
+            return
+
+        all_paths = df["project_path"].tolist()
+        persisted = st.session_state.get("selected_project_path")
+        if persisted not in all_paths:
+            persisted = all_paths[0] if all_paths else None
+            st.session_state["selected_project_path"] = persisted
+
+        if not persisted:
+            st.info("No project selected. Go to the Table and click a row.")
+            return
+
+        idx = all_paths.index(persisted)
+        chosen_path = st.selectbox(
+            "Project",
+            all_paths,
+            index=idx,
+            format_func=lambda p: f"{Path(p).name}   ({p})",
+            key="project_selectbox",
+        )
+        if chosen_path != persisted:
+            st.session_state["selected_project_path"] = chosen_path
+            st.rerun()
+
+        selected = df[df["project_path"] == chosen_path].iloc[0]
+
+        # Quick action bar
+        qa1, qa2, qa3 = st.columns([1, 1, 5])
+        if qa1.button("📂 Open in Explorer", use_container_width=True, key="open_proj_explorer"):
             open_in_explorer(str(selected["project_path"]))
-        if quick_cols[1].button("Open root in Explorer", use_container_width=True):
+        if qa2.button("📂 Open root", use_container_width=True, key="open_root_explorer"):
             open_in_explorer(str(selected["source_root"]))
-        st.subheader("Metadata")
-        st.write(f"**Name**: {selected.get('project_name')}")
-        st.write(f"**Root**: {selected.get('source_root')}")
-        st.write(f"**Git tree**: {bool_icon(int(selected.get('has_git_tree', 0)), '🌿 Yes', 'No')}")
-        st.write(f"**Remote**: {bool_icon(int(selected.get('has_remote', 0)), '☁️ Yes', 'No')}")
-        st.write(f"**Empty**: {bool_icon(int(selected.get('is_empty', 0)), '📭 Yes', 'No')}")
-        st.write(f"**Files**: {selected.get('total_files')}")
-        st.write(f"**Folders**: {selected.get('total_dirs')}")
-        st.write(f"**Logical size**: {format_bytes(selected.get('logical_size_bytes'))}")
-        st.write(f"**On-disk size**: {format_bytes(selected.get('allocated_size_bytes'))}")
-        st.write(f"**Last file update**: {selected.get('last_file_modified_utc')}")
-        st.write(f"**Languages**: {selected.get('top_languages') or '-'}")
-        st.write(f"**Framework hints**: {selected.get('framework_hints') or '-'}")
-        st.write(f"**OneDrive states**: `{selected.get('onedrive_states')}`")
-        render_git_panel(selected)
+
+        # Drilldown sub-tabs (st.tabs is fine here — no programmatic switching needed)
+        t_files, t_pkg, t_readme, t_git, t_info = st.tabs([
+            "🗂️ Files", "📦 Package", "📖 README", "🌿 Git", "ℹ️ Info"
+        ])
+
+        with t_files:
+            render_explorer(str(selected["project_path"]))
+        with t_pkg:
+            render_package_panel(str(selected["project_path"]))
+        with t_readme:
+            render_readme_tab(str(selected["project_path"]))
+        with t_git:
+            render_git_panel(selected)
+        with t_info:
+            render_metadata_panel(selected)
+
+    # --- READMEs cards ---
+    elif active == _NAV_READMES:
+        st.subheader("README Overview")
+        if df.empty:
+            st.warning("No inventory found. Run a scan first.")
+        else:
+            render_readme_cards(df)
 
 
 if __name__ == "__main__":
