@@ -1,6 +1,6 @@
 param(
-    [string]$LeftRoot = "D:\OneDrive\projects",
-    [string]$RightRoot = "D:\projects"
+    [string]$LeftRoot = "",
+    [string]$RightRoot = ""
 )
 
 Set-StrictMode -Version Latest

@@ -1,5 +1,5 @@
 param(
-    [string]$RootPath = $(if (Test-Path -LiteralPath "D:\OneDrive\projects") { "D:\OneDrive\projects" } else { (Get-Location).Path })
+    [string]$RootPath = (Get-Location).Path
 )
 
 Set-StrictMode -Version Latest

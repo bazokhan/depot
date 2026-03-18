@@ -1,8 +1,17 @@
+```
+╔══════════════════════════════╗
+║  📦  D E P O T               ║
+║  local project inventory     ║
+╚══════════════════════════════╝
+```
+
 # Depot
 
 **Depot** is a local project inventory dashboard — a Streamlit app that scans your project folders, indexes rich metadata, and gives you a fast, filterable command center for everything on your machine.
 
 Stop wondering what's in that folder. Just open Depot.
+
+> **100% local. No accounts. No telemetry. No cloud. Your data never leaves your machine.**
 
 ---
 
@@ -19,6 +28,18 @@ To stop the running server:
 ```powershell
 .\stop.ps1
 ```
+
+---
+
+## Privacy
+
+Depot is designed to be entirely offline:
+
+- **No telemetry** — nothing is tracked or reported anywhere
+- **No accounts** — no sign-in, no cloud sync, no API keys required
+- **No network calls** — all scanning, indexing, and browsing is local
+- **Your data is yours** — the SQLite database and `.repo-meta.json` files live on your machine and go nowhere
+- **Read-only by default** — Depot never modifies your project files
 
 ---
 
@@ -52,8 +73,12 @@ To stop the running server:
 - Browse any project's folder tree without leaving the dashboard
 - Click to preview: **text files, source code, images** rendered inline
 - File icons for 50+ extensions
-- Shows ignored folders (node_modules, .venv, .next, etc.) as badges with tooltips
 - **Open in Explorer** button to jump directly to any folder or file in Windows Explorer
+
+### Ignored Folders
+- Globally configure folders to skip during scanning (e.g. `node_modules`, `.venv`, `.next`, `__pycache__`)
+- Ignored folders that exist inside a project are shown as **badges with tooltips** in the file explorer — you can see them without scanning them
+- Managed from the sidebar — no config file editing required
 
 ### Live Preview Server
 - Projects with an `index.html` get a **Launch Preview** button
@@ -89,8 +114,7 @@ Annotate projects without touching your code — stored in `.repo-meta.json` ins
 Hidden/archived projects are accessible via the **🙈 Hidden** nav section.
 
 ### Configurable Scan
-- Add/remove scan roots from the sidebar
-- Configure globally ignored folders (node_modules, .venv, .git, etc.)
+- Add/remove scan roots from the sidebar — point Depot at any folder on any drive
 - Run a full rescan anytime — results saved to a local SQLite database
 
 ---
@@ -102,7 +126,7 @@ Hidden/archived projects are accessible via the **🙈 Hidden** nav section.
 | `depot.py` | Main Streamlit app |
 | `start.ps1` | Launch script — sets up venv, installs deps, starts dashboard |
 | `stop.ps1` | Kills the running Streamlit process |
-| `depot_config.json` | Scan roots and ignored folders (auto-created) |
+| `depot_config.json` | Scan roots and ignored folders (auto-created on first run) |
 | `depot.db` | SQLite project index (auto-created on first scan) |
 
 ---
@@ -117,8 +141,8 @@ Standalone scripts — no Python required.
 | `compare-folder-metrics.ps1` | Side-by-side comparison of two roots by name, size, file count, folder count |
 
 ```powershell
-.\scan-folder-status.ps1 -RootPath "D:\projects"
-.\compare-folder-metrics.ps1 -LeftRoot "D:\OneDrive\projects" -RightRoot "D:\projects"
+.\scan-folder-status.ps1 -RootPath "C:\Users\you\projects"
+.\compare-folder-metrics.ps1 -LeftRoot "C:\Users\you\OneDrive\projects" -RightRoot "C:\Users\you\projects"
 ```
 
 > If script execution is blocked: `powershell -NoProfile -ExecutionPolicy Bypass -File ".\start.ps1"`
@@ -138,4 +162,4 @@ Dependencies are installed automatically by `start.ps1`.
 
 - `.repo-meta.json` files can be committed alongside your projects — metadata travels with the repo
 - Hidden projects are excluded from the main table but always accessible via **🙈 Hidden** in the nav
-- The SQLite database (`depot.db`) is local only — nothing leaves your machine
+- `depot.db` and `depot_config.json` are local to your Depot install — add them to `.gitignore` if you fork this repo

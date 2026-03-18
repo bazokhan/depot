@@ -226,14 +226,14 @@ def open_in_explorer(path: str) -> None:
         st.warning(f"Could not open path: {exc}")
 
 
-def pick_folder(initial_dir: str = r"D:\\") -> Optional[str]:
+def pick_folder(initial_dir: str = "") -> Optional[str]:
     try:
         import tkinter as tk
         from tkinter import filedialog
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
-        selected = filedialog.askdirectory(initialdir=initial_dir or r"D:\\")
+        selected = filedialog.askdirectory(initialdir=initial_dir or "")
         root.destroy()
         return selected if selected else None
     except Exception:
