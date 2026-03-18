@@ -16,8 +16,8 @@ import pandas as pd
 import streamlit as st
 
 
-DB_PATH = Path(__file__).with_name("project_inventory.db")
-CONFIG_PATH = Path(__file__).with_name("project_inventory_config.json")
+DB_PATH = Path(__file__).with_name("depot.db")
+CONFIG_PATH = Path(__file__).with_name("depot_config.json")
 
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".csv", ".log",
@@ -89,6 +89,54 @@ FILE_ATTRIBUTE_UNPINNED = 0x00100000
 FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x00040000
 FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x00400000
 
+# CDN icon URLs and fallback emojis for well-known ignored folder names.
+# CDN icons are used in the detail panel (HTML); emojis in the table column.
+IGNORED_FOLDER_CDN_ICONS: Dict[str, Tuple[str, str]] = {
+    "node_modules": ("https://cdn.simpleicons.org/npm/CB3837", "npm packages"),
+    ".venv":        ("https://cdn.simpleicons.org/python/3776AB", "Python venv"),
+    "venv":         ("https://cdn.simpleicons.org/python/3776AB", "Python venv"),
+    "__pycache__":  ("https://cdn.simpleicons.org/python/3776AB", "Python cache"),
+    ".next":        ("https://cdn.simpleicons.org/nextdotjs/000000", "Next.js build"),
+    ".nuxt":        ("https://cdn.simpleicons.org/nuxtdotjs/00DC82", "Nuxt build"),
+    "vendor":       ("https://cdn.simpleicons.org/composer/885630", "Composer vendor"),
+}
+IGNORED_FOLDER_EMOJI: Dict[str, str] = {
+    "node_modules": "📦",
+    ".venv": "🐍", "venv": "🐍", "__pycache__": "🐍",
+    "dist": "📤", "build": "🔨", "vendor": "📦", "target": "🎯",
+    ".cache": "💾", "coverage": "📊", ".next": "▲", ".nuxt": "💚",
+    ".output": "📤", "out": "📤", ".turbo": "⚡",
+}
+DEFAULT_IGNORED_FOLDERS = ["node_modules", ".venv", "__pycache__"]
+
+# ---------------------------------------------------------------------------
+# User metadata constants
+# ---------------------------------------------------------------------------
+
+REPO_META_FILENAME = ".repo-meta.json"
+
+USER_STATUS_OPTIONS = ["", "active", "archived", "completed", "abandoned", "wip", "template"]
+
+USER_STATUS_ICONS: Dict[str, str] = {
+    "active":    "🟢",
+    "archived":  "🗃️",
+    "completed": "✅",
+    "abandoned": "💀",
+    "wip":       "🚧",
+    "template":  "📋",
+    "":          "—",
+}
+
+USER_META_DEFAULTS: Dict[str, object] = {
+    "hidden":      False,
+    "status":      "",
+    "pinned":      False,
+    "tags":        [],
+    "category":    "",
+    "description": "",
+    "notes":       "",
+}
+
 
 # ---------------------------------------------------------------------------
 # Generic utilities
@@ -107,6 +155,43 @@ def format_bytes(num: Optional[int]) -> str:
 
 def bool_icon(value: int, yes: str = "✅", no: str = "—") -> str:
     return yes if int(value) == 1 else no
+
+
+def ignored_folders_badge(ignored_json: str) -> str:
+    """Return an emoji-based badge string for display in the inventory table."""
+    if not ignored_json:
+        return "—"
+    try:
+        folders = json.loads(ignored_json)
+        if not folders:
+            return "—"
+        return " ".join(IGNORED_FOLDER_EMOJI.get(f, "📁") + " " + f for f in folders)
+    except Exception:
+        return "—"
+
+
+def ignored_folders_html(ignored_json: str) -> str:
+    """Return HTML with CDN icons for display in the detail panel."""
+    if not ignored_json:
+        return ""
+    try:
+        folders = json.loads(ignored_json)
+        if not folders:
+            return ""
+        parts = []
+        for f in folders:
+            if f in IGNORED_FOLDER_CDN_ICONS:
+                url, label = IGNORED_FOLDER_CDN_ICONS[f]
+                parts.append(
+                    f'<img src="{url}" width="16" height="16" style="vertical-align:middle;margin-right:4px" '
+                    f'title="{label}"> <code>{f}</code>'
+                )
+            else:
+                emoji = IGNORED_FOLDER_EMOJI.get(f, "📁")
+                parts.append(f'{emoji} <code>{f}</code>')
+        return " &nbsp; ".join(parts)
+    except Exception:
+        return ""
 
 
 def path_to_file_url(path: str) -> str:
@@ -343,7 +428,9 @@ def stop_live_server(project_path: str) -> None:
 # Scanner
 # ---------------------------------------------------------------------------
 
-def scan_project(project_path: str, source_root: str) -> Dict[str, object]:
+def scan_project(project_path: str, source_root: str, ignored_folders: set = None) -> Dict[str, object]:
+    if ignored_folders is None:
+        ignored_folders = set()
     project_name = os.path.basename(project_path)
     is_git_repo = os.path.exists(os.path.join(project_path, ".git"))
 
@@ -360,6 +447,7 @@ def scan_project(project_path: str, source_root: str) -> Dict[str, object]:
     file_samples: List[Tuple[str, int]] = []
     latest_file_mtime = None
     error_count = 0
+    ignored_found: set = set()
 
     stack = [project_path]
     while stack:
@@ -370,6 +458,10 @@ def scan_project(project_path: str, source_root: str) -> Dict[str, object]:
                     if entry.name == ".git" and entry.is_dir(follow_symlinks=False):
                         has_nested_git = True
                     if entry.is_dir(follow_symlinks=False):
+                        # Skip globally-ignored folder names but record their presence
+                        if entry.name in ignored_folders:
+                            ignored_found.add(entry.name)
+                            continue
                         try:
                             attrs = entry.stat(follow_symlinks=False).st_file_attributes
                             if attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT:
@@ -430,7 +522,7 @@ def scan_project(project_path: str, source_root: str) -> Dict[str, object]:
     last_commit_date = run_git(project_path, ["log", "-1", "--date=iso-strict", "--pretty=%cd"]) if is_git_repo else None
     last_commit_author = run_git(project_path, ["log", "-1", "--pretty=%an"]) if is_git_repo else None
 
-    return {
+    result = {
         "project_name": project_name,
         "project_path": project_path,
         "source_root": source_root,
@@ -455,7 +547,10 @@ def scan_project(project_path: str, source_root: str) -> Dict[str, object]:
         "onedrive_states": json.dumps(one_drive_states, ensure_ascii=True),
         "duplicate_signature": build_signature(file_samples),
         "scan_errors": error_count,
+        "ignored_folders_found": json.dumps(sorted(ignored_found), ensure_ascii=True),
     }
+    result.update(_meta_to_db_fields(read_repo_meta(project_path)))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -491,10 +586,33 @@ def initialize_db(db_path: Path) -> None:
                 onedrive_states TEXT,
                 duplicate_signature TEXT,
                 scan_errors INTEGER NOT NULL,
-                scanned_at_utc TEXT NOT NULL
+                ignored_folders_found TEXT,
+                scanned_at_utc TEXT NOT NULL,
+                user_hidden INTEGER NOT NULL DEFAULT 0,
+                user_pinned INTEGER NOT NULL DEFAULT 0,
+                user_status TEXT NOT NULL DEFAULT '',
+                user_tags TEXT NOT NULL DEFAULT '[]',
+                user_category TEXT NOT NULL DEFAULT '',
+                user_description TEXT NOT NULL DEFAULT '',
+                user_notes TEXT NOT NULL DEFAULT ''
             )
             """
         )
+        # Migrations: add columns to existing databases that predate these features
+        for _col_def in [
+            "ignored_folders_found TEXT",
+            "user_hidden INTEGER NOT NULL DEFAULT 0",
+            "user_pinned INTEGER NOT NULL DEFAULT 0",
+            "user_status TEXT NOT NULL DEFAULT ''",
+            "user_tags TEXT NOT NULL DEFAULT '[]'",
+            "user_category TEXT NOT NULL DEFAULT ''",
+            "user_description TEXT NOT NULL DEFAULT ''",
+            "user_notes TEXT NOT NULL DEFAULT ''",
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE projects ADD COLUMN {_col_def}")
+            except Exception:
+                pass  # Column already exists
 
 
 def save_scan(rows: List[Dict[str, object]], db_path: Path) -> None:
@@ -511,14 +629,18 @@ def save_scan(rows: List[Dict[str, object]], db_path: Path) -> None:
                     last_file_modified_utc, total_files, total_dirs, logical_size_bytes,
                     allocated_size_bytes, allocated_size_missing_files, is_empty, top_languages,
                     top_extensions, framework_hints, onedrive_states, duplicate_signature,
-                    scan_errors, scanned_at_utc
+                    scan_errors, ignored_folders_found, scanned_at_utc,
+                    user_hidden, user_pinned, user_status, user_tags,
+                    user_category, user_description, user_notes
                 ) VALUES (
                     :project_name, :project_path, :source_root, :is_git_repo, :has_git_tree, :has_remote,
                     :remote_url, :remote_owner, :default_branch, :last_commit_date, :last_commit_author,
                     :last_file_modified_utc, :total_files, :total_dirs, :logical_size_bytes,
                     :allocated_size_bytes, :allocated_size_missing_files, :is_empty, :top_languages,
                     :top_extensions, :framework_hints, :onedrive_states, :duplicate_signature,
-                    :scan_errors, :scanned_at_utc
+                    :scan_errors, :ignored_folders_found, :scanned_at_utc,
+                    :user_hidden, :user_pinned, :user_status, :user_tags,
+                    :user_category, :user_description, :user_notes
                 )
                 """,
                 row,
@@ -534,6 +656,7 @@ def load_projects(db_path: Path) -> pd.DataFrame:
 
 
 def scan_roots(roots: List[str]) -> List[Dict[str, object]]:
+    ignored_folders = set(_load_ignored_folders())
     rows: List[Dict[str, object]] = []
     progress = st.progress(0.0, text="Preparing scan...")
     projects = []
@@ -549,7 +672,7 @@ def scan_roots(roots: List[str]) -> List[Dict[str, object]]:
         return rows
     for idx, (project_path, source_root) in enumerate(projects, start=1):
         progress.progress(idx / len(projects), text=f"Scanning {idx}/{len(projects)}: {project_path}")
-        rows.append(scan_project(project_path, source_root))
+        rows.append(scan_project(project_path, source_root, ignored_folders))
     progress.empty()
     return rows
 
@@ -558,26 +681,164 @@ def scan_roots(roots: List[str]) -> List[Dict[str, object]]:
 # Config persistence (roots survive server restarts)
 # ---------------------------------------------------------------------------
 
-def _load_saved_roots() -> List[str]:
+def _load_config() -> dict:
     if CONFIG_PATH.exists():
         try:
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            roots = data.get("scan_roots", [])
-            if isinstance(roots, list):
-                return [str(r) for r in roots]
+            if isinstance(data, dict):
+                return data
         except Exception:
             pass
-    return []
+    return {}
+
+
+def _save_config(data: dict) -> None:
+    try:
+        CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_saved_roots() -> List[str]:
+    roots = _load_config().get("scan_roots", [])
+    return [str(r) for r in roots] if isinstance(roots, list) else []
 
 
 def _save_roots(roots: List[str]) -> None:
+    data = _load_config()
+    data["scan_roots"] = roots
+    _save_config(data)
+
+
+def _load_ignored_folders() -> List[str]:
+    cfg = _load_config()
+    if "ignored_folders" not in cfg:
+        return list(DEFAULT_IGNORED_FOLDERS)
+    folders = cfg["ignored_folders"]
+    return [str(f) for f in folders] if isinstance(folders, list) else list(DEFAULT_IGNORED_FOLDERS)
+
+
+def _save_ignored_folders(folders: List[str]) -> None:
+    data = _load_config()
+    data["ignored_folders"] = folders
+    _save_config(data)
+
+
+# ---------------------------------------------------------------------------
+# Per-project user metadata (.repo-meta.json)
+# ---------------------------------------------------------------------------
+
+def read_repo_meta(project_path: str) -> Dict[str, object]:
+    """Read .repo-meta.json from a project folder. Returns defaults on any error."""
+    path = Path(project_path) / REPO_META_FILENAME
+    if not path.exists():
+        return dict(USER_META_DEFAULTS)
     try:
-        CONFIG_PATH.write_text(
-            json.dumps({"scan_roots": roots}, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        raw = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except Exception:
-        pass
+        return dict(USER_META_DEFAULTS)
+    if not isinstance(raw, dict):
+        return dict(USER_META_DEFAULTS)
+    result = dict(USER_META_DEFAULTS)
+    for key, default in USER_META_DEFAULTS.items():
+        val = raw.get(key)
+        if val is None:
+            continue
+        if isinstance(default, bool) and isinstance(val, bool):
+            result[key] = val
+        elif isinstance(default, str) and isinstance(val, str):
+            result[key] = val
+        elif isinstance(default, list) and isinstance(val, list):
+            result[key] = [str(t).strip() for t in val if str(t).strip()]
+    # Normalise status
+    if result["status"] not in USER_STATUS_OPTIONS:
+        result["status"] = ""
+    return result
+
+
+def write_repo_meta(project_path: str, meta: Dict[str, object]) -> bool:
+    """Write .repo-meta.json to the project folder. Returns True on success."""
+    path = Path(project_path) / REPO_META_FILENAME
+    output = {k: meta[k] for k in USER_META_DEFAULTS if k in meta}
+    try:
+        path.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding="utf-8")
+        return True
+    except Exception as exc:
+        st.warning(f"Could not save metadata to {path}: {exc}")
+        return False
+
+
+def sync_meta_to_db(project_path: str, meta: Dict[str, object], db_path: Path) -> None:
+    """Update only the user_* columns for one project in SQLite without a full rescan."""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                UPDATE projects SET
+                    user_hidden=?, user_pinned=?, user_status=?,
+                    user_tags=?, user_category=?, user_description=?, user_notes=?
+                WHERE project_path=?
+                """,
+                (
+                    int(bool(meta.get("hidden"))),
+                    int(bool(meta.get("pinned"))),
+                    str(meta.get("status") or ""),
+                    json.dumps(meta.get("tags") or [], ensure_ascii=False),
+                    str(meta.get("category") or ""),
+                    str(meta.get("description") or ""),
+                    str(meta.get("notes") or ""),
+                    project_path,
+                ),
+            )
+            conn.commit()
+    except Exception as exc:
+        st.warning(f"Could not update metadata in database: {exc}")
+
+
+def _meta_to_db_fields(meta: Dict[str, object]) -> Dict[str, object]:
+    """Convert a metadata dict to the flat DB column values used in scan rows."""
+    return {
+        "user_hidden":      int(bool(meta.get("hidden"))),
+        "user_pinned":      int(bool(meta.get("pinned"))),
+        "user_status":      str(meta.get("status") or ""),
+        "user_tags":        json.dumps(meta.get("tags") or [], ensure_ascii=False),
+        "user_category":    str(meta.get("category") or ""),
+        "user_description": str(meta.get("description") or ""),
+        "user_notes":       str(meta.get("notes") or ""),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Sidebar metadata filters
+# ---------------------------------------------------------------------------
+
+def render_meta_filters(df: pd.DataFrame) -> Dict[str, object]:
+    """Render label/metadata filter widgets in the sidebar and return active filter values."""
+    with st.expander("🏷️ Labels & Filters", expanded=False):
+        show_hidden = st.checkbox("Show hidden projects", value=False, key="mf_show_hidden")
+
+        selected_statuses = st.multiselect(
+            "Status filter",
+            options=[s for s in USER_STATUS_OPTIONS if s],
+            format_func=lambda s: f"{USER_STATUS_ICONS.get(s, '')} {s}",
+            key="mf_statuses",
+        )
+
+        # Collect all tags across visible projects
+        all_tags: List[str] = []
+        if "user_tags" in df.columns:
+            for raw in df["user_tags"].dropna():
+                try:
+                    for t in json.loads(raw):
+                        if t and t not in all_tags:
+                            all_tags.append(t)
+                except Exception:
+                    pass
+        all_tags.sort()
+
+        selected_tags = st.multiselect("Tag filter", options=all_tags, key="mf_tags")
+
+    return {"show_hidden": show_hidden, "statuses": selected_statuses, "tags": selected_tags}
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +909,45 @@ def render_root_editor() -> Tuple[bool, List[str]]:
     elif not valid:
         st.warning("Enter at least one valid path.")
     st.caption("Scans immediate child folders under each root.")
+
+    # ------------------------------------------------------------------
+    # Ignored folders section
+    # ------------------------------------------------------------------
+    st.markdown("---")
+    st.subheader("Ignored Folders")
+    st.caption("Folder names skipped during counting. Their presence is still shown as icons.")
+
+    if "ignored_folders_list" not in st.session_state:
+        st.session_state["ignored_folders_list"] = _load_ignored_folders()
+    ignored = list(st.session_state["ignored_folders_list"])
+
+    remove_ignored_idx = None
+    for i, fname in enumerate(ignored):
+        icon = IGNORED_FOLDER_EMOJI.get(fname, "📁")
+        cols = st.columns([6, 1])
+        cols[0].markdown(f"{icon} `{fname}`")
+        if cols[1].button("✕", key=f"rm_ignored_{i}", help="Remove", use_container_width=True):
+            remove_ignored_idx = i
+
+    if remove_ignored_idx is not None:
+        ignored.pop(remove_ignored_idx)
+        st.session_state["ignored_folders_list"] = ignored
+        _save_ignored_folders(ignored)
+        st.rerun()
+
+    new_name = st.text_input(
+        "Add ignored folder", key="new_ignored_folder_input",
+        placeholder="e.g. node_modules, dist, .cache",
+        label_visibility="collapsed",
+    )
+    if st.button("+ Add ignored folder", use_container_width=True):
+        name = new_name.strip()
+        if name and name not in ignored:
+            ignored.append(name)
+            st.session_state["ignored_folders_list"] = ignored
+            _save_ignored_folders(ignored)
+            st.rerun()
+
     return st.button("Run Full Scan", type="primary", use_container_width=True, disabled=not valid), valid
 
 
@@ -655,7 +955,7 @@ def render_root_editor() -> Tuple[bool, List[str]]:
 # Inventory table
 # ---------------------------------------------------------------------------
 
-def apply_inventory_filters(df: pd.DataFrame) -> pd.DataFrame:
+def apply_inventory_filters(df: pd.DataFrame, meta_filters: Optional[Dict[str, object]] = None) -> pd.DataFrame:
     c1, c2, c3, c4 = st.columns([2.2, 1, 1, 1])
     search_text = c1.text_input("Search name/path", "")
     source_options = sorted(df["source_root"].dropna().unique().tolist())
@@ -700,10 +1000,27 @@ def apply_inventory_filters(df: pd.DataFrame) -> pd.DataFrame:
 
     name_counts = view.groupby("project_name")["project_path"].count().to_dict()
     view["in_multiple_roots"] = view["project_name"].map(lambda n: 1 if name_counts.get(n, 0) > 1 else 0)
+
+    if meta_filters:
+        if not meta_filters.get("show_hidden", False):
+            if "user_hidden" in view.columns:
+                view = view[view["user_hidden"] != 1]
+        selected_statuses = meta_filters.get("statuses") or []
+        if selected_statuses and "user_status" in view.columns:
+            view = view[view["user_status"].isin(selected_statuses)]
+        selected_tags = meta_filters.get("tags") or []
+        if selected_tags and "user_tags" in view.columns:
+            def _has_any_tag(tags_json: str) -> bool:
+                try:
+                    return any(t in selected_tags for t in json.loads(tags_json or "[]"))
+                except Exception:
+                    return False
+            view = view[view["user_tags"].apply(_has_any_tag)]
+
     return view
 
 
-def render_inventory(df: pd.DataFrame) -> pd.DataFrame:
+def render_inventory(df: pd.DataFrame, meta_filters: Optional[Dict[str, object]] = None) -> pd.DataFrame:
     if df.empty:
         st.warning("No inventory found yet. Run a scan from the sidebar.")
         return df
@@ -714,9 +1031,20 @@ def render_inventory(df: pd.DataFrame) -> pd.DataFrame:
     col_c.metric("With Remote", f"{int(df['has_remote'].sum())}")
     col_d.metric("Empty", f"{int(df['is_empty'].sum())}")
 
-    st.subheader("Project Inventory")
+    st.subheader("Projects")
     st.caption("Click a row to select a project for the drilldown below.")
-    view = apply_inventory_filters(df)
+    view = apply_inventory_filters(df, meta_filters)
+
+    # Show hidden count hint
+    if "user_hidden" in df.columns and not (meta_filters or {}).get("show_hidden", False):
+        hidden_count = int((df["user_hidden"] == 1).sum())
+        if hidden_count > 0:
+            st.caption(f"🙈 {hidden_count} hidden project(s) not shown — use **Labels & Filters** in sidebar to show them.")
+
+    # Pinned projects float to top
+    if "user_pinned" in view.columns:
+        view = view.sort_values(["user_pinned", "project_name"], ascending=[False, True]).reset_index(drop=True)
+
     table = view.copy()
     table["Git"] = table["has_git_tree"].map(lambda v: bool_icon(v, "🌿", "—"))
     table["Remote"] = table["has_remote"].map(lambda v: bool_icon(v, "☁️", "—"))
@@ -727,13 +1055,37 @@ def render_inventory(df: pd.DataFrame) -> pd.DataFrame:
     table["Logical size"] = table["logical_size_bytes"].map(format_bytes)
     table["On-disk size"] = table["allocated_size_bytes"].map(format_bytes)
     table["Errors"] = table["scan_errors"].map(lambda n: "⚠️" if int(n) > 0 else "—")
+    if "ignored_folders_found" in table.columns:
+        table["Ignored"] = table["ignored_folders_found"].map(ignored_folders_badge)
+    else:
+        table["Ignored"] = "—"
+    if "user_status" in table.columns:
+        table["Status"] = table["user_status"].map(
+            lambda s: (USER_STATUS_ICONS.get(s or "", "—") + (" " + s if s else "")).strip()
+        )
+    else:
+        table["Status"] = "—"
+    if "user_tags" in table.columns:
+        def _fmt_tags(tags_json: str) -> str:
+            try:
+                tags = json.loads(tags_json or "[]")
+                return ", ".join(tags) if tags else "—"
+            except Exception:
+                return "—"
+        table["Tags"] = table["user_tags"].apply(_fmt_tags)
+    else:
+        table["Tags"] = "—"
+    if "user_pinned" in table.columns:
+        table["Pin"] = table["user_pinned"].map(lambda v: "📌" if int(v) == 1 else "—")
+    else:
+        table["Pin"] = "—"
 
     show = table[
         [
-            "project_name", "source_root", "Git", "Remote", "remote_owner", "Remote URL",
+            "Pin", "Status", "project_name", "Tags", "source_root", "Git", "Remote", "remote_owner", "Remote URL",
             "Empty", "Both roots", "Duplicates", "total_files", "total_dirs",
             "Logical size", "On-disk size", "last_commit_date",
-            "last_file_modified_utc", "top_languages", "framework_hints", "Errors", "project_path",
+            "last_file_modified_utc", "top_languages", "framework_hints", "Ignored", "Errors", "project_path",
         ]
     ].rename(
         columns={
@@ -758,6 +1110,9 @@ def render_inventory(df: pd.DataFrame) -> pd.DataFrame:
         selection_mode="single-row",
         key="projects_table",
         column_config={
+            "Pin": st.column_config.TextColumn(width="small"),
+            "Status": st.column_config.TextColumn(width="small"),
+            "Tags": st.column_config.TextColumn(width="medium"),
             "Project": st.column_config.TextColumn(width="medium"),
             "Root": st.column_config.TextColumn(width="medium"),
             "Path": st.column_config.TextColumn(width="large"),
@@ -1230,6 +1585,9 @@ def render_readme_cards(df: pd.DataFrame) -> None:
         st.info("No projects in the current view.")
         return
 
+    if "user_hidden" in df.columns:
+        df = df[df["user_hidden"] != 1]
+
     st.caption(f"Showing {len(df)} projects. Click a card to open the project view.")
     cols_per_row = 3
     projects = df.to_dict("records")
@@ -1339,6 +1697,12 @@ def render_metadata_panel(row: pd.Series) -> None:
         st.metric("Scan errors", int(row.get("scan_errors", 0)))
 
     st.markdown("---")
+    ignored_html = ignored_folders_html(row.get("ignored_folders_found") or "")
+    if ignored_html:
+        st.markdown("**Ignored folders detected:**")
+        st.markdown(ignored_html, unsafe_allow_html=True)
+        st.markdown("")
+
     fields = [
         ("Languages", row.get("top_languages") or "—"),
         ("Frameworks", row.get("framework_hints") or "—"),
@@ -1354,30 +1718,113 @@ def render_metadata_panel(row: pd.Series) -> None:
 
 
 # ---------------------------------------------------------------------------
+# User metadata editor
+# ---------------------------------------------------------------------------
+
+def render_user_meta_editor(project_path: str, db_path: Path) -> None:
+    """Render the Labels & Notes expander for per-project user metadata."""
+    with st.expander("🏷️ Labels & Notes", expanded=False):
+        meta = read_repo_meta(project_path)
+        st.caption(f"Stored in `{REPO_META_FILENAME}` inside the project folder. Survives rescans.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            new_hidden = st.checkbox(
+                "Hidden (exclude from main table)",
+                value=bool(meta["hidden"]),
+                key=f"meta_hidden::{project_path}",
+            )
+            new_pinned = st.checkbox(
+                "Pinned (show first in table)",
+                value=bool(meta["pinned"]),
+                key=f"meta_pinned::{project_path}",
+            )
+        with col2:
+            status_idx = USER_STATUS_OPTIONS.index(str(meta["status"])) if meta["status"] in USER_STATUS_OPTIONS else 0
+            new_status = st.selectbox(
+                "Status",
+                options=USER_STATUS_OPTIONS,
+                index=status_idx,
+                key=f"meta_status::{project_path}",
+                format_func=lambda s: (f"{USER_STATUS_ICONS.get(s, '')} {s}").strip() if s else "— (none)",
+            )
+            new_category = st.text_input(
+                "Category",
+                value=str(meta["category"]),
+                key=f"meta_category::{project_path}",
+                placeholder="e.g. Work, Learning, Games",
+            )
+
+        tags_raw = st.text_input(
+            "Tags (comma-separated)",
+            value=", ".join(meta["tags"]) if meta["tags"] else "",  # type: ignore[arg-type]
+            key=f"meta_tags::{project_path}",
+            placeholder="e.g. frontend, work, learning",
+        )
+
+        new_description = st.text_area(
+            "Description",
+            value=str(meta["description"]),
+            key=f"meta_description::{project_path}",
+            height=80,
+            placeholder="Short description of this project",
+        )
+        new_notes = st.text_area(
+            "Private notes",
+            value=str(meta["notes"]),
+            key=f"meta_notes::{project_path}",
+            height=60,
+            placeholder="Internal notes (not shown in table)",
+        )
+
+        if st.button("💾 Save", key=f"meta_save::{project_path}", type="primary"):
+            new_tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+            updated: Dict[str, object] = {
+                "hidden":      new_hidden,
+                "status":      new_status,
+                "pinned":      new_pinned,
+                "tags":        new_tags,
+                "category":    new_category.strip(),
+                "description": new_description.strip(),
+                "notes":       new_notes.strip(),
+            }
+            ok = write_repo_meta(project_path, updated)
+            if ok:
+                sync_meta_to_db(project_path, updated, db_path)
+                st.success("Saved.")
+                st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 _NAV_TABLE = "table"
 _NAV_PROJECT = "project"
 _NAV_READMES = "readmes"
+_NAV_HIDDEN = "hidden"
 
 
 def main() -> None:
-    st.set_page_config(page_title="Project Inventory Dashboard", page_icon="🗂️", layout="wide")
-    st.title("🗂️ Project Inventory Dashboard")
-    st.caption("Read-only developer companion for managing local repos.")
+    st.set_page_config(page_title="Depot", page_icon="🗂️", layout="wide")
+    st.title("🗂️ Depot")
+    st.caption("Your local project depot.")
 
     initialize_db(DB_PATH)
 
     with st.sidebar:
         scan_now, roots = render_root_editor()
 
+    df = load_projects(DB_PATH)
+
+    with st.sidebar:
+        meta_filters = render_meta_filters(df)
+
     if scan_now:
         rows = scan_roots(roots)
         save_scan(rows, DB_PATH)
         st.success(f"Scan complete: {len(rows)} projects indexed.")
-
-    df = load_projects(DB_PATH)
+        df = load_projects(DB_PATH)
 
     if "active_tab" not in st.session_state:
         st.session_state["active_tab"] = _NAV_TABLE
@@ -1388,7 +1835,7 @@ def main() -> None:
     selected_path = st.session_state.get("selected_project_path")
     proj_label = f"🔍 {Path(selected_path).name}" if selected_path else "🔍 Project"
 
-    n1, n2, n3 = st.columns(3)
+    n1, n2, n3, n4 = st.columns(4)
     if n1.button(
         "📋 Table", use_container_width=True,
         type="primary" if active == _NAV_TABLE else "secondary",
@@ -1407,12 +1854,18 @@ def main() -> None:
     ):
         st.session_state["active_tab"] = _NAV_READMES
         st.rerun()
+    if n4.button(
+        "🙈 Hidden", use_container_width=True,
+        type="primary" if active == _NAV_HIDDEN else "secondary",
+    ):
+        st.session_state["active_tab"] = _NAV_HIDDEN
+        st.rerun()
 
     st.markdown("---")
 
     # --- Table view ---
     if active == _NAV_TABLE:
-        render_inventory(df)
+        render_inventory(df, meta_filters)
 
     # --- Project drilldown ---
     elif active == _NAV_PROJECT:
@@ -1451,6 +1904,9 @@ def main() -> None:
         if qa2.button("📂 Open root", use_container_width=True, key="open_root_explorer"):
             open_in_explorer(str(selected["source_root"]))
 
+        # Per-project metadata editor (above sub-tabs so it's always accessible)
+        render_user_meta_editor(str(selected["project_path"]), DB_PATH)
+
         # Drilldown sub-tabs (st.tabs is fine here — no programmatic switching needed)
         t_files, t_pkg, t_readme, t_git, t_info = st.tabs([
             "🗂️ Files", "📦 Package", "📖 README", "🌿 Git", "ℹ️ Info"
@@ -1474,6 +1930,20 @@ def main() -> None:
             st.warning("No inventory found. Run a scan first.")
         else:
             render_readme_cards(df)
+
+    # --- Hidden / archived view ---
+    elif active == _NAV_HIDDEN:
+        st.subheader("🙈 Hidden & Archived Projects")
+        if df.empty:
+            st.warning("No inventory found. Run a scan first.")
+        else:
+            hidden_mask = (df.get("user_hidden", pd.Series(dtype=int)) == 1) if "user_hidden" in df.columns else pd.Series([False] * len(df))
+            archived_mask = (df.get("user_status", pd.Series(dtype=str)) == "archived") if "user_status" in df.columns else pd.Series([False] * len(df))
+            combined = df[hidden_mask | archived_mask].drop_duplicates(subset=["project_path"])
+            if combined.empty:
+                st.info("No hidden or archived projects. Mark projects as hidden or archived using the 🏷️ Labels & Notes editor in the Project view.")
+            else:
+                render_inventory(combined, meta_filters={"show_hidden": True, "statuses": [], "tags": []})
 
 
 if __name__ == "__main__":

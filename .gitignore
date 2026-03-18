@@ -11,10 +11,19 @@ env/
 # Streamlit and local runtime artifacts
 .streamlit/
 
-# Local database and temporary outputs
+# Depot local data (generated at runtime, machine-specific)
+depot.db
+depot.db-*
+depot_config.json
+
+# Legacy names (pre-rename)
 project_inventory.db
 project_inventory.db-*
+project_inventory_config.json
+
+# Logs and temp files
 *.log
+*.tmp
 
 # Test and type-checker caches
 .pytest_cache/
@@ -25,3 +34,6 @@ Thumbs.db
 .DS_Store
 .vscode/
 .idea/
+
+# Claude Code local settings (machine-specific)
+.claude/

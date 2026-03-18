@@ -9,7 +9,7 @@ $activatePath = Join-Path $venvPath "Scripts\Activate.ps1"
 $venvPythonPath = Join-Path $venvPath "Scripts\python.exe"
 $venvPipPath = Join-Path $venvPath "Scripts\pip.exe"
 $requirementsPath = Join-Path $scriptDir "requirements-dashboard.txt"
-$dashboardScript = Join-Path $scriptDir "project_inventory_dashboard.py"
+$dashboardScript = Join-Path $scriptDir "depot.py"
 
 if (-not (Test-Path -LiteralPath $dashboardScript)) {
     throw "Missing dashboard script: $dashboardScript"
