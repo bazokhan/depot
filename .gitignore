@@ -37,3 +37,7 @@ Thumbs.db
 
 # Claude Code local settings (machine-specific)
 .claude/
+
+# Personal session context and prompts (machine-specific, not for public repo)
+continue_conversation.md
+crawl-and-tag-prompt.md

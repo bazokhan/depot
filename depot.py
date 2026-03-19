@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import socket
+import sys
 import sqlite3
 import stat
 import subprocess
@@ -116,6 +117,12 @@ DEFAULT_IGNORED_FOLDERS = ["node_modules", ".venv", "__pycache__"]
 REPO_META_FILENAME = ".repo-meta.json"
 
 USER_STATUS_OPTIONS = ["", "active", "archived", "completed", "abandoned", "wip", "template"]
+# Brand options are NOT hardcoded — they are user-configurable from the dashboard and stored in
+# depot_config.json under "custom_brands". This keeps the repo free of personal identifiers.
+# Use _get_brand_options() everywhere instead of this constant.
+USER_BRAND_OPTIONS     = [""]   # fallback; always prefer _get_brand_options()
+USER_TYPE_OPTIONS      = ["", "library", "tool", "game", "website", "api", "experiment"]
+USER_OWNERSHIP_OPTIONS = ["", "personal", "client", "employed", "collaborative", "forked"]
 
 USER_STATUS_ICONS: Dict[str, str] = {
     "active":    "🟢",
@@ -128,13 +135,23 @@ USER_STATUS_ICONS: Dict[str, str] = {
 }
 
 USER_META_DEFAULTS: Dict[str, object] = {
-    "hidden":      False,
-    "status":      "",
-    "pinned":      False,
-    "tags":        [],
-    "category":    "",
-    "description": "",
-    "notes":       "",
+    "hidden":       False,
+    "status":       "",
+    "pinned":       False,
+    "tags":         [],
+    "category":     "",
+    "description":  "",
+    "notes":        "",
+    # Extended fields
+    "display_name": "",
+    "brand":        "",
+    "type":         "",
+    "ownership":    "",
+    "portfolio":    [],
+    "featured":     False,
+    "priority":     50,
+    "live_url":     "",
+    "demo_url":     "",
 }
 
 
@@ -608,6 +625,15 @@ def initialize_db(db_path: Path) -> None:
             "user_category TEXT NOT NULL DEFAULT ''",
             "user_description TEXT NOT NULL DEFAULT ''",
             "user_notes TEXT NOT NULL DEFAULT ''",
+            "user_display_name TEXT NOT NULL DEFAULT ''",
+            "user_brand TEXT NOT NULL DEFAULT ''",
+            "user_type TEXT NOT NULL DEFAULT ''",
+            "user_ownership TEXT NOT NULL DEFAULT ''",
+            "user_portfolio TEXT NOT NULL DEFAULT '[]'",
+            "user_featured INTEGER NOT NULL DEFAULT 0",
+            "user_priority INTEGER NOT NULL DEFAULT 50",
+            "user_live_url TEXT NOT NULL DEFAULT ''",
+            "user_demo_url TEXT NOT NULL DEFAULT ''",
         ]:
             try:
                 conn.execute(f"ALTER TABLE projects ADD COLUMN {_col_def}")
@@ -631,7 +657,9 @@ def save_scan(rows: List[Dict[str, object]], db_path: Path) -> None:
                     top_extensions, framework_hints, onedrive_states, duplicate_signature,
                     scan_errors, ignored_folders_found, scanned_at_utc,
                     user_hidden, user_pinned, user_status, user_tags,
-                    user_category, user_description, user_notes
+                    user_category, user_description, user_notes,
+                    user_display_name, user_brand, user_type, user_ownership,
+                    user_portfolio, user_featured, user_priority, user_live_url, user_demo_url
                 ) VALUES (
                     :project_name, :project_path, :source_root, :is_git_repo, :has_git_tree, :has_remote,
                     :remote_url, :remote_owner, :default_branch, :last_commit_date, :last_commit_author,
@@ -640,7 +668,9 @@ def save_scan(rows: List[Dict[str, object]], db_path: Path) -> None:
                     :top_extensions, :framework_hints, :onedrive_states, :duplicate_signature,
                     :scan_errors, :ignored_folders_found, :scanned_at_utc,
                     :user_hidden, :user_pinned, :user_status, :user_tags,
-                    :user_category, :user_description, :user_notes
+                    :user_category, :user_description, :user_notes,
+                    :user_display_name, :user_brand, :user_type, :user_ownership,
+                    :user_portfolio, :user_featured, :user_priority, :user_live_url, :user_demo_url
                 )
                 """,
                 row,
@@ -724,6 +754,34 @@ def _save_ignored_folders(folders: List[str]) -> None:
     _save_config(data)
 
 
+def _load_portfolios() -> List[Dict]:
+    portfolios = _load_config().get("portfolios", [])
+    return portfolios if isinstance(portfolios, list) else []
+
+
+def _save_portfolios(portfolios: List[Dict]) -> None:
+    data = _load_config()
+    data["portfolios"] = portfolios
+    _save_config(data)
+
+
+def _load_custom_brands() -> List[str]:
+    """Return the user-configured brand names (without the leading empty string)."""
+    brands = _load_config().get("custom_brands", [])
+    return [str(b).strip() for b in brands if str(b).strip()] if isinstance(brands, list) else []
+
+
+def _save_custom_brands(brands: List[str]) -> None:
+    data = _load_config()
+    data["custom_brands"] = [b for b in brands if b.strip()]
+    _save_config(data)
+
+
+def _get_brand_options() -> List[str]:
+    """Return the full brand dropdown options: empty sentinel + configured brands."""
+    return [""] + _load_custom_brands()
+
+
 # ---------------------------------------------------------------------------
 # Per-project user metadata (.repo-meta.json)
 # ---------------------------------------------------------------------------
@@ -746,13 +804,26 @@ def read_repo_meta(project_path: str) -> Dict[str, object]:
             continue
         if isinstance(default, bool) and isinstance(val, bool):
             result[key] = val
+        elif isinstance(default, int) and not isinstance(default, bool):
+            # int fields (e.g. priority); coerce and clamp to 0-100 for priority
+            try:
+                result[key] = max(0, min(100, int(val))) if key == "priority" else int(val)
+            except (TypeError, ValueError):
+                pass
         elif isinstance(default, str) and isinstance(val, str):
             result[key] = val
         elif isinstance(default, list) and isinstance(val, list):
             result[key] = [str(t).strip() for t in val if str(t).strip()]
-    # Normalise status
+    # Normalise controlled-vocabulary fields
     if result["status"] not in USER_STATUS_OPTIONS:
         result["status"] = ""
+    # brand is user-configurable, so accept any non-empty string
+    if not isinstance(result["brand"], str):
+        result["brand"] = ""
+    if result["type"] not in USER_TYPE_OPTIONS:
+        result["type"] = ""
+    if result["ownership"] not in USER_OWNERSHIP_OPTIONS:
+        result["ownership"] = ""
     return result
 
 
@@ -768,6 +839,89 @@ def write_repo_meta(project_path: str, meta: Dict[str, object]) -> bool:
         return False
 
 
+def delete_repo_meta(project_path: str, db_path: Path) -> Tuple[bool, str]:
+    """Delete .repo-meta.json (if present) and reset all user_* columns in DB to defaults."""
+    path = Path(project_path) / REPO_META_FILENAME
+    errors = []
+    if path.exists():
+        try:
+            path.unlink()
+        except Exception as exc:
+            errors.append(f"Could not delete file: {exc}")
+    try:
+        sync_meta_to_db(project_path, dict(USER_META_DEFAULTS), db_path)
+    except Exception as exc:
+        errors.append(f"Could not reset DB: {exc}")
+    if errors:
+        return False, " | ".join(errors)
+    return True, ""
+
+
+def sync_meta_from_file(project_path: str, db_path: Path) -> Tuple[bool, str]:
+    """Read .repo-meta.json and push its values into the DB. No-op if file missing."""
+    path = Path(project_path) / REPO_META_FILENAME
+    if not path.exists():
+        return False, f"{REPO_META_FILENAME} not found — nothing to sync."
+    try:
+        meta = read_repo_meta(project_path)
+        sync_meta_to_db(project_path, meta, db_path)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _has_meaningful_meta(row: "pd.Series") -> bool:
+    """Return True if any user_* DB column holds a non-default value."""
+    checks = [
+        int(row.get("user_hidden", 0)) != 0,
+        int(row.get("user_pinned", 0)) != 0,
+        str(row.get("user_status", "")) != "",
+        str(row.get("user_tags", "[]")) not in ("[]", ""),
+        str(row.get("user_category", "")) != "",
+        str(row.get("user_description", "")) != "",
+        str(row.get("user_brand", "")) != "",
+        str(row.get("user_type", "")) != "",
+        str(row.get("user_ownership", "")) != "",
+        str(row.get("user_portfolio", "[]")) not in ("[]", ""),
+        int(row.get("user_featured", 0)) != 0,
+        int(row.get("user_priority", 50)) != 50,
+        str(row.get("user_live_url", "")) != "",
+        str(row.get("user_demo_url", "")) != "",
+        str(row.get("user_display_name", "")) != "",
+    ]
+    return any(checks)
+
+
+def _row_to_meta_dict(row: "pd.Series") -> Dict[str, object]:
+    """Convert a DB row back to a .repo-meta.json-compatible dict."""
+    try:
+        tags = json.loads(str(row.get("user_tags") or "[]"))
+    except Exception:
+        tags = []
+    try:
+        portfolio = json.loads(str(row.get("user_portfolio") or "[]"))
+    except Exception:
+        portfolio = []
+    return {
+        "hidden":       bool(int(row.get("user_hidden", 0))),
+        "status":       str(row.get("user_status", "")),
+        "pinned":       bool(int(row.get("user_pinned", 0))),
+        "tags":         tags,
+        "category":     str(row.get("user_category", "")),
+        "description":  str(row.get("user_description", "")),
+        "notes":        str(row.get("user_notes", "")),
+        "display_name": str(row.get("user_display_name", "")),
+        "brand":        str(row.get("user_brand", "")),
+        "type":         str(row.get("user_type", "")),
+        "ownership":    str(row.get("user_ownership", "")),
+        "portfolio":    portfolio,
+        "featured":     bool(int(row.get("user_featured", 0))),
+        "priority":     int(row.get("user_priority", 50)),
+        "live_url":     str(row.get("user_live_url", "")),
+        "demo_url":     str(row.get("user_demo_url", "")),
+    }
+
+
 def sync_meta_to_db(project_path: str, meta: Dict[str, object], db_path: Path) -> None:
     """Update only the user_* columns for one project in SQLite without a full rescan."""
     try:
@@ -776,7 +930,10 @@ def sync_meta_to_db(project_path: str, meta: Dict[str, object], db_path: Path) -
                 """
                 UPDATE projects SET
                     user_hidden=?, user_pinned=?, user_status=?,
-                    user_tags=?, user_category=?, user_description=?, user_notes=?
+                    user_tags=?, user_category=?, user_description=?, user_notes=?,
+                    user_display_name=?, user_brand=?, user_type=?, user_ownership=?,
+                    user_portfolio=?, user_featured=?, user_priority=?,
+                    user_live_url=?, user_demo_url=?
                 WHERE project_path=?
                 """,
                 (
@@ -787,6 +944,15 @@ def sync_meta_to_db(project_path: str, meta: Dict[str, object], db_path: Path) -
                     str(meta.get("category") or ""),
                     str(meta.get("description") or ""),
                     str(meta.get("notes") or ""),
+                    str(meta.get("display_name") or ""),
+                    str(meta.get("brand") or ""),
+                    str(meta.get("type") or ""),
+                    str(meta.get("ownership") or ""),
+                    json.dumps(meta.get("portfolio") or [], ensure_ascii=False),
+                    int(bool(meta.get("featured"))),
+                    int(meta.get("priority") if meta.get("priority") is not None else 50),
+                    str(meta.get("live_url") or ""),
+                    str(meta.get("demo_url") or ""),
                     project_path,
                 ),
             )
@@ -798,14 +964,140 @@ def sync_meta_to_db(project_path: str, meta: Dict[str, object], db_path: Path) -
 def _meta_to_db_fields(meta: Dict[str, object]) -> Dict[str, object]:
     """Convert a metadata dict to the flat DB column values used in scan rows."""
     return {
-        "user_hidden":      int(bool(meta.get("hidden"))),
-        "user_pinned":      int(bool(meta.get("pinned"))),
-        "user_status":      str(meta.get("status") or ""),
-        "user_tags":        json.dumps(meta.get("tags") or [], ensure_ascii=False),
-        "user_category":    str(meta.get("category") or ""),
-        "user_description": str(meta.get("description") or ""),
-        "user_notes":       str(meta.get("notes") or ""),
+        "user_hidden":       int(bool(meta.get("hidden"))),
+        "user_pinned":       int(bool(meta.get("pinned"))),
+        "user_status":       str(meta.get("status") or ""),
+        "user_tags":         json.dumps(meta.get("tags") or [], ensure_ascii=False),
+        "user_category":     str(meta.get("category") or ""),
+        "user_description":  str(meta.get("description") or ""),
+        "user_notes":        str(meta.get("notes") or ""),
+        "user_display_name": str(meta.get("display_name") or ""),
+        "user_brand":        str(meta.get("brand") or ""),
+        "user_type":         str(meta.get("type") or ""),
+        "user_ownership":    str(meta.get("ownership") or ""),
+        "user_portfolio":    json.dumps(meta.get("portfolio") or [], ensure_ascii=False),
+        "user_featured":     int(bool(meta.get("featured"))),
+        "user_priority":     int(meta.get("priority") if meta.get("priority") is not None else 50),
+        "user_live_url":     str(meta.get("live_url") or ""),
+        "user_demo_url":     str(meta.get("demo_url") or ""),
     }
+
+
+# ---------------------------------------------------------------------------
+# Portfolio generation
+# ---------------------------------------------------------------------------
+
+def build_portfolio_entry(row: "pd.Series") -> Dict:
+    """Map a DB row (pd.Series) to a depot-portfolio.json item dict."""
+    # URL priority chain: user_live_url → user_demo_url is separate, github not yet fetched
+    live_url = str(row.get("user_live_url") or "")
+    if not live_url:
+        live_url = str(row.get("gh_live_url") or "")
+    if not live_url:
+        live_url = str(row.get("gh_homepage") or "")
+
+    github_url = remote_to_web_url(str(row.get("remote_url") or "")) or ""
+    if github_url and "github.com" not in github_url:
+        github_url = ""  # only expose GitHub URLs in portfolio
+
+    display_name = str(row.get("user_display_name") or "").strip()
+    if not display_name:
+        display_name = str(row.get("project_name") or "")
+
+    description = str(row.get("user_description") or "").strip()
+    if not description:
+        description = str(row.get("gh_description") or "").strip()
+
+    try:
+        tags = json.loads(str(row.get("user_tags") or "[]"))
+    except Exception:
+        tags = []
+
+    try:
+        gh_topics = json.loads(str(row.get("gh_topics") or "[]"))
+    except Exception:
+        gh_topics = []
+
+    last_commit = str(row.get("last_commit_date") or "")
+    if last_commit and "T" in last_commit:
+        last_commit = last_commit.split("T")[0]
+
+    return {
+        "id":              str(row.get("project_name") or ""),
+        "display_name":    display_name,
+        "description":     description,
+        "brand":           str(row.get("user_brand") or ""),
+        "type":            str(row.get("user_type") or ""),
+        "ownership":       str(row.get("user_ownership") or ""),
+        "status":          str(row.get("user_status") or ""),
+        "featured":        bool(int(row.get("user_featured") or 0)),
+        "priority":        int(row.get("user_priority") or 50),
+        "tags":            tags,
+        "category":        str(row.get("user_category") or ""),
+        "live_url":        live_url,
+        "demo_url":        str(row.get("user_demo_url") or ""),
+        "github_url":      github_url,
+        "gh_stars":        int(row.get("gh_stars") or 0) if row.get("gh_stars") is not None else None,
+        "gh_forks":        int(row.get("gh_forks") or 0) if row.get("gh_forks") is not None else None,
+        "gh_topics":       gh_topics,
+        "top_languages":   str(row.get("top_languages") or ""),
+        "framework_hints": str(row.get("framework_hints") or ""),
+        "last_commit_date": last_commit,
+    }
+
+
+def generate_portfolio_json(portfolio_id: str, df: "pd.DataFrame") -> Dict:
+    """Build the full depot-portfolio.json dict for a given portfolio site."""
+    if df.empty:
+        items = []
+    else:
+        # Filter to projects assigned to this portfolio and not hidden
+        def _in_portfolio(portfolio_json: str) -> bool:
+            try:
+                return portfolio_id in json.loads(portfolio_json or "[]")
+            except Exception:
+                return False
+
+        mask = df["user_portfolio"].apply(_in_portfolio)
+        if "user_hidden" in df.columns:
+            mask = mask & (df["user_hidden"] != 1)
+        filtered = df[mask].copy()
+
+        # Sort: featured first, then by priority desc, then name asc
+        if not filtered.empty:
+            filtered = filtered.sort_values(
+                ["user_featured", "user_priority", "project_name"],
+                ascending=[False, False, True],
+            ).reset_index(drop=True)
+
+        items = [build_portfolio_entry(row) for _, row in filtered.iterrows()]
+
+    return {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generator":    "depot",
+        "version":      "1",
+        "portfolio_id": portfolio_id,
+        "items":        items,
+    }
+
+
+def write_portfolio_json(portfolio: Dict, df: "pd.DataFrame") -> Tuple[bool, str]:
+    """Write depot-portfolio.json for a portfolio site. Returns (success, path_or_error)."""
+    site_path = portfolio.get("path", "").strip()
+    output_file = portfolio.get("output_file", "public/depot-portfolio.json").strip()
+    if not site_path:
+        return False, "Portfolio path is not configured."
+    output_path = Path(site_path) / output_file
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        data = generate_portfolio_json(portfolio["id"], df)
+        output_path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return True, str(output_path)
+    except Exception as exc:
+        return False, str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -838,117 +1130,175 @@ def render_meta_filters(df: pd.DataFrame) -> Dict[str, object]:
 
         selected_tags = st.multiselect("Tag filter", options=all_tags, key="mf_tags")
 
-    return {"show_hidden": show_hidden, "statuses": selected_statuses, "tags": selected_tags}
+        selected_brands = st.multiselect(
+            "Brand filter",
+            options=[b for b in _get_brand_options() if b],
+            key="mf_brands",
+        )
+        selected_types = st.multiselect(
+            "Type filter",
+            options=[t for t in USER_TYPE_OPTIONS if t],
+            key="mf_types",
+        )
+
+    return {
+        "show_hidden": show_hidden,
+        "statuses": selected_statuses,
+        "tags": selected_tags,
+        "brands": selected_brands,
+        "types": selected_types,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Sidebar scan controls
 # ---------------------------------------------------------------------------
 
-def render_root_editor() -> Tuple[bool, List[str]]:
-    st.header("Scan Controls")
-
+def render_root_editor() -> Tuple[bool, bool, List[str]]:
+    # Pre-load roots so we can compute valid before rendering widgets
     if "scan_roots_list" not in st.session_state:
         st.session_state["scan_roots_list"] = _load_saved_roots()
+    roots_precheck = list(st.session_state["scan_roots_list"])
+    valid_precheck = [r.strip() for r in roots_precheck if r.strip()]
 
-    roots = list(st.session_state["scan_roots_list"])
+    # ── Primary action — always visible at the top ──────────────────────────
+    scan_now = st.button(
+        "Run Full Scan",
+        type="primary",
+        use_container_width=True,
+        disabled=not valid_precheck,
+        help="Scan all configured roots and update the inventory",
+    )
 
-    # Apply any value queued by a Browse pick BEFORE widgets are instantiated.
-    # (Streamlit forbids setting a widget's key after the widget is created.)
-    pending = st.session_state.pop("_pending_root_update", None)
-    if pending is not None:
-        p_idx, p_val = pending
-        st.session_state[f"scan_root_{p_idx}"] = p_val  # safe: widget not yet created
+    if not valid_precheck:
+        st.caption("Add a scan root below to enable scanning.")
 
-    st.caption("Paths are saved to disk and persist across restarts.")
-    remove_index = None
-    for idx in range(len(roots)):
-        widget_key = f"scan_root_{idx}"
-        cols = st.columns([7, 1, 1])
-        roots[idx] = cols[0].text_input(
-            f"Root {idx + 1}", value=roots[idx], key=widget_key,
-            label_visibility="collapsed",
-            placeholder=f"Root {idx + 1} — paste or browse",
-        )
-        if cols[1].button("📂", key=f"browse_{idx}", use_container_width=True, help="Browse for folder"):
-            chosen = pick_folder(roots[idx] if roots[idx].strip() else r"C:\\")
-            if chosen:
-                roots[idx] = chosen
-                st.session_state["scan_roots_list"] = roots
-                # Queue the widget value update for the next render cycle
-                st.session_state["_pending_root_update"] = (idx, chosen)
-                _save_roots(roots)
-                st.rerun()
+    # ── Scan Roots — expanded by default ────────────────────────────────────
+    with st.expander("Scan Roots", expanded=True):
+        roots = list(st.session_state["scan_roots_list"])
 
-        if cols[2].button("✕", key=f"remove_{idx}", use_container_width=True, help="Remove this root"):
-            remove_index = idx
+        # Apply any value queued by a Browse pick BEFORE widgets are instantiated.
+        pending = st.session_state.pop("_pending_root_update", None)
+        if pending is not None:
+            p_idx, p_val = pending
+            st.session_state[f"scan_root_{p_idx}"] = p_val
 
-    if remove_index is not None:
-        roots.pop(remove_index)
-        # Clear widget keys from the removed index onward so they re-render
-        # with correct values (keys shift down after removal)
-        for i in range(remove_index, len(roots) + 1):
-            st.session_state.pop(f"scan_root_{i}", None)
+        st.caption("Paths are saved to disk and persist across restarts.")
+        remove_index = None
+        for idx in range(len(roots)):
+            widget_key = f"scan_root_{idx}"
+            cols = st.columns([7, 1, 1])
+            roots[idx] = cols[0].text_input(
+                f"Root {idx + 1}", value=roots[idx], key=widget_key,
+                label_visibility="collapsed",
+                placeholder=f"Root {idx + 1} — paste or browse",
+            )
+            if cols[1].button("📂", key=f"browse_{idx}", use_container_width=True, help="Browse"):
+                chosen = pick_folder(roots[idx] if roots[idx].strip() else r"C:\\")
+                if chosen:
+                    roots[idx] = chosen
+                    st.session_state["scan_roots_list"] = roots
+                    st.session_state["_pending_root_update"] = (idx, chosen)
+                    _save_roots(roots)
+                    st.rerun()
+            if cols[2].button("✕", key=f"remove_{idx}", use_container_width=True, help="Remove"):
+                remove_index = idx
+
+        if remove_index is not None:
+            roots.pop(remove_index)
+            for i in range(remove_index, len(roots) + 1):
+                st.session_state.pop(f"scan_root_{i}", None)
+            st.session_state["scan_roots_list"] = roots
+            _save_roots(roots)
+            st.rerun()
+
+        if st.button("+ Add root", use_container_width=True):
+            roots.append("")
+            st.session_state["scan_roots_list"] = roots
+            _save_roots(roots)
+            st.rerun()
+
         st.session_state["scan_roots_list"] = roots
         _save_roots(roots)
-        st.rerun()
-
-    if st.button("+ Add root", use_container_width=True):
-        roots.append("")
-        st.session_state["scan_roots_list"] = roots
-        _save_roots(roots)
-        st.rerun()
-
-    # Persist any manual edits made in the text inputs this render cycle
-    st.session_state["scan_roots_list"] = roots
-    _save_roots(roots)
 
     valid = [r.strip() for r in roots if r.strip()]
-    if not roots:
-        st.info("No roots configured. Add a folder path and run a scan.")
-    elif not valid:
-        st.warning("Enter at least one valid path.")
-    st.caption("Scans immediate child folders under each root.")
 
-    # ------------------------------------------------------------------
-    # Ignored folders section
-    # ------------------------------------------------------------------
-    st.markdown("---")
-    st.subheader("Ignored Folders")
-    st.caption("Folder names skipped during counting. Their presence is still shown as icons.")
+    # ── Crawl & Auto-tag (optional) ─────────────────────────────────────────
+    crawl_script = Path(__file__).with_name("crawl_and_tag.py")
+    crawl_clicked = False
+    if crawl_script.exists():
+        crawl_clicked = st.button(
+            "Crawl & Auto-tag",
+            use_container_width=True,
+            disabled=not valid,
+            help="Classify projects and write .repo-meta.json (never overwrites manual tags)",
+        )
 
-    if "ignored_folders_list" not in st.session_state:
-        st.session_state["ignored_folders_list"] = _load_ignored_folders()
-    ignored = list(st.session_state["ignored_folders_list"])
+    # ── Ignored Folders — collapsed by default ──────────────────────────────
+    with st.expander("Ignored Folders", expanded=False):
+        st.caption("Folder names skipped during counting. Their presence is still shown as badges.")
 
-    remove_ignored_idx = None
-    for i, fname in enumerate(ignored):
-        icon = IGNORED_FOLDER_EMOJI.get(fname, "📁")
-        cols = st.columns([6, 1])
-        cols[0].markdown(f"{icon} `{fname}`")
-        if cols[1].button("✕", key=f"rm_ignored_{i}", help="Remove", use_container_width=True):
-            remove_ignored_idx = i
+        if "ignored_folders_list" not in st.session_state:
+            st.session_state["ignored_folders_list"] = _load_ignored_folders()
+        ignored = list(st.session_state["ignored_folders_list"])
 
-    if remove_ignored_idx is not None:
-        ignored.pop(remove_ignored_idx)
-        st.session_state["ignored_folders_list"] = ignored
-        _save_ignored_folders(ignored)
-        st.rerun()
+        remove_ignored_idx = None
+        for i, fname in enumerate(ignored):
+            icon = IGNORED_FOLDER_EMOJI.get(fname, "📁")
+            cols = st.columns([6, 1])
+            cols[0].markdown(f"{icon} `{fname}`")
+            if cols[1].button("✕", key=f"rm_ignored_{i}", help="Remove", use_container_width=True):
+                remove_ignored_idx = i
 
-    new_name = st.text_input(
-        "Add ignored folder", key="new_ignored_folder_input",
-        placeholder="e.g. node_modules, dist, .cache",
-        label_visibility="collapsed",
-    )
-    if st.button("+ Add ignored folder", use_container_width=True):
-        name = new_name.strip()
-        if name and name not in ignored:
-            ignored.append(name)
+        if remove_ignored_idx is not None:
+            ignored.pop(remove_ignored_idx)
             st.session_state["ignored_folders_list"] = ignored
             _save_ignored_folders(ignored)
             st.rerun()
 
-    return st.button("Run Full Scan", type="primary", use_container_width=True, disabled=not valid), valid
+        new_name = st.text_input(
+            "Add ignored folder", key="new_ignored_folder_input",
+            placeholder="e.g. node_modules, dist, .cache",
+            label_visibility="collapsed",
+        )
+        if st.button("+ Add ignored folder", use_container_width=True):
+            name = new_name.strip()
+            if name and name not in ignored:
+                ignored.append(name)
+                st.session_state["ignored_folders_list"] = ignored
+                _save_ignored_folders(ignored)
+                st.rerun()
+
+    # ── Brand Labels — collapsed by default ─────────────────────────────────
+    with st.expander("Brand Labels", expanded=False):
+        st.caption("Custom brand names used in project labels and portfolio sync.")
+        custom_brands = _load_custom_brands()
+
+        remove_brand_idx = None
+        for i, brand in enumerate(custom_brands):
+            bc1, bc2 = st.columns([5, 1])
+            bc1.markdown(f"`{brand}`")
+            if bc2.button("✕", key=f"rm_brand_{i}", help="Remove", use_container_width=True):
+                remove_brand_idx = i
+
+        if remove_brand_idx is not None:
+            custom_brands.pop(remove_brand_idx)
+            _save_custom_brands(custom_brands)
+            st.rerun()
+
+        new_brand_input = st.text_input(
+            "Add brand", key="new_brand_input",
+            placeholder="e.g. acme, myco, personal",
+            label_visibility="collapsed",
+        )
+        if st.button("+ Add brand", use_container_width=True):
+            nb = new_brand_input.strip().lower()
+            if nb and nb not in custom_brands:
+                custom_brands.append(nb)
+                _save_custom_brands(custom_brands)
+                st.rerun()
+
+    return scan_now, crawl_clicked, valid
 
 
 # ---------------------------------------------------------------------------
@@ -956,17 +1306,21 @@ def render_root_editor() -> Tuple[bool, List[str]]:
 # ---------------------------------------------------------------------------
 
 def apply_inventory_filters(df: pd.DataFrame, meta_filters: Optional[Dict[str, object]] = None) -> pd.DataFrame:
-    c1, c2, c3, c4 = st.columns([2.2, 1, 1, 1])
-    search_text = c1.text_input("Search name/path", "")
+    # Primary filters — always visible
+    c1, c2 = st.columns([3, 2])
+    search_text = c1.text_input("Search", "", placeholder="project name or path…", label_visibility="collapsed")
     source_options = sorted(df["source_root"].dropna().unique().tolist())
-    selected_sources = c2.multiselect("Roots", source_options, default=source_options)
-    git_choice = c3.selectbox("Git", ["All", "With git tree", "Without git tree"])
-    remote_choice = c4.selectbox("Remote", ["All", "With remote", "Without remote"])
+    selected_sources = c2.multiselect("Roots", source_options, default=source_options, label_visibility="collapsed",
+                                      placeholder="All roots")
 
-    d1, d2, d3 = st.columns([1, 1, 2])
-    empty_choice = d1.selectbox("Empty", ["All", "Empty only", "Non-empty only"])
-    duplicates_choice = d2.selectbox("Duplicates", ["All", "Only duplicate groups", "Unique only"])
-    min_files = d3.slider("Min file count", min_value=0, max_value=max(int(df["total_files"].max()), 0), value=0)
+    # Advanced filters — collapsed by default
+    with st.expander("Advanced filters", expanded=False):
+        d1, d2, d3, d4 = st.columns([1, 1, 1, 2])
+        git_choice = d1.selectbox("Git", ["All", "With git tree", "Without git tree"])
+        remote_choice = d2.selectbox("Remote", ["All", "With remote", "Without remote"])
+        empty_choice = d3.selectbox("Empty", ["All", "Empty only", "Non-empty only"])
+        duplicates_choice = d4.selectbox("Duplicates", ["All", "Only duplicate groups", "Unique only"])
+        min_files = st.slider("Min file count", min_value=0, max_value=max(int(df["total_files"].max()), 0), value=0)
 
     view = df.copy()
     if search_text.strip():
@@ -1016,6 +1370,12 @@ def apply_inventory_filters(df: pd.DataFrame, meta_filters: Optional[Dict[str, o
                 except Exception:
                     return False
             view = view[view["user_tags"].apply(_has_any_tag)]
+        selected_brands = meta_filters.get("brands") or []
+        if selected_brands and "user_brand" in view.columns:
+            view = view[view["user_brand"].isin(selected_brands)]
+        selected_types = meta_filters.get("types") or []
+        if selected_types and "user_type" in view.columns:
+            view = view[view["user_type"].isin(selected_types)]
 
     return view
 
@@ -1025,21 +1385,22 @@ def render_inventory(df: pd.DataFrame, meta_filters: Optional[Dict[str, object]]
         st.warning("No inventory found yet. Run a scan from the sidebar.")
         return df
 
-    col_a, col_b, col_c, col_d = st.columns(4)
-    col_a.metric("Projects", f"{len(df)}")
-    col_b.metric("With Git", f"{int(df['has_git_tree'].sum())}")
-    col_c.metric("With Remote", f"{int(df['has_remote'].sum())}")
-    col_d.metric("Empty", f"{int(df['is_empty'].sum())}")
+    # Compact inline stats — one line, no wasted vertical space
+    git_n    = int(df["has_git_tree"].sum())
+    remote_n = int(df["has_remote"].sum())
+    empty_n  = int(df["is_empty"].sum())
+    hidden_n = int((df["user_hidden"] == 1).sum()) if "user_hidden" in df.columns else 0
+    stats_parts = [
+        f"**{len(df)}** projects",
+        f"🌿 {git_n} git",
+        f"☁️ {remote_n} remote",
+        f"📭 {empty_n} empty",
+    ]
+    if hidden_n and not (meta_filters or {}).get("show_hidden", False):
+        stats_parts.append(f"🙈 {hidden_n} hidden")
+    st.caption("  ·  ".join(stats_parts) + "   —   click any row to open project")
 
-    st.subheader("Projects")
-    st.caption("Click a row to select a project for the drilldown below.")
     view = apply_inventory_filters(df, meta_filters)
-
-    # Show hidden count hint
-    if "user_hidden" in df.columns and not (meta_filters or {}).get("show_hidden", False):
-        hidden_count = int((df["user_hidden"] == 1).sum())
-        if hidden_count > 0:
-            st.caption(f"🙈 {hidden_count} hidden project(s) not shown — use **Labels & Filters** in sidebar to show them.")
 
     # Pinned projects float to top
     if "user_pinned" in view.columns:
@@ -1777,22 +2138,250 @@ def render_user_meta_editor(project_path: str, db_path: Path) -> None:
             placeholder="Internal notes (not shown in table)",
         )
 
-        if st.button("💾 Save", key=f"meta_save::{project_path}", type="primary"):
+        st.markdown("**Identity & Publishing**")
+        id1, id2, id3, id4 = st.columns(4)
+        new_display_name = id1.text_input(
+            "Display name",
+            value=str(meta["display_name"]),
+            key=f"meta_display_name::{project_path}",
+            placeholder="Pretty name for portfolios",
+        )
+        brand_opts = _get_brand_options()
+        brand_idx = brand_opts.index(str(meta["brand"])) if meta["brand"] in brand_opts else 0
+        new_brand = id2.selectbox(
+            "Brand",
+            options=brand_opts,
+            index=brand_idx,
+            key=f"meta_brand::{project_path}",
+            format_func=lambda s: s if s else "— (none)",
+        )
+        type_idx = USER_TYPE_OPTIONS.index(str(meta["type"])) if meta["type"] in USER_TYPE_OPTIONS else 0
+        new_type = id3.selectbox(
+            "Type",
+            options=USER_TYPE_OPTIONS,
+            index=type_idx,
+            key=f"meta_type::{project_path}",
+            format_func=lambda s: s if s else "— (none)",
+        )
+        own_idx = USER_OWNERSHIP_OPTIONS.index(str(meta["ownership"])) if meta["ownership"] in USER_OWNERSHIP_OPTIONS else 0
+        new_ownership = id4.selectbox(
+            "Ownership",
+            options=USER_OWNERSHIP_OPTIONS,
+            index=own_idx,
+            key=f"meta_ownership::{project_path}",
+            format_func=lambda s: s if s else "— (none)",
+        )
+
+        url1, url2 = st.columns(2)
+        new_live_url = url1.text_input(
+            "Live URL",
+            value=str(meta["live_url"]),
+            key=f"meta_live_url::{project_path}",
+            placeholder="https://your-deployment.vercel.app",
+        )
+        new_demo_url = url2.text_input(
+            "Demo URL",
+            value=str(meta["demo_url"]),
+            key=f"meta_demo_url::{project_path}",
+            placeholder="https://demo.example.com",
+        )
+
+        fp1, fp2 = st.columns([1, 2])
+        new_featured = fp1.checkbox(
+            "Featured",
+            value=bool(meta["featured"]),
+            key=f"meta_featured::{project_path}",
+            help="Highlighted in portfolio output",
+        )
+        new_priority = fp2.slider(
+            "Priority (0–100)",
+            min_value=0, max_value=100,
+            value=int(meta["priority"]),  # type: ignore[arg-type]
+            key=f"meta_priority::{project_path}",
+            help="Higher = shown first in portfolio",
+        )
+
+        portfolio_options = [p["id"] for p in _load_portfolios()]
+        current_portfolio = meta["portfolio"] if isinstance(meta["portfolio"], list) else []
+        new_portfolio = st.multiselect(
+            "Appears in portfolios",
+            options=portfolio_options,
+            default=[p for p in current_portfolio if p in portfolio_options],
+            key=f"meta_portfolio::{project_path}",
+            help="Configure portfolio sites on the Portfolios page" if not portfolio_options else None,
+        )
+        if not portfolio_options:
+            st.caption("No portfolios configured yet — add them on the 📤 Portfolios page.")
+
+        if st.button("💾 Save labels", key=f"meta_save::{project_path}", type="primary", use_container_width=True):
             new_tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
             updated: Dict[str, object] = {
-                "hidden":      new_hidden,
-                "status":      new_status,
-                "pinned":      new_pinned,
-                "tags":        new_tags,
-                "category":    new_category.strip(),
-                "description": new_description.strip(),
-                "notes":       new_notes.strip(),
+                "hidden":       new_hidden,
+                "status":       new_status,
+                "pinned":       new_pinned,
+                "tags":         new_tags,
+                "category":     new_category.strip(),
+                "description":  new_description.strip(),
+                "notes":        new_notes.strip(),
+                "display_name": new_display_name.strip(),
+                "brand":        new_brand,
+                "type":         new_type,
+                "ownership":    new_ownership,
+                "live_url":     new_live_url.strip(),
+                "demo_url":     new_demo_url.strip(),
+                "featured":     new_featured,
+                "priority":     new_priority,
+                "portfolio":    new_portfolio,
             }
             ok = write_repo_meta(project_path, updated)
             if ok:
                 sync_meta_to_db(project_path, updated, db_path)
                 st.success("Saved.")
                 st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Portfolios page
+# ---------------------------------------------------------------------------
+
+def render_portfolios_page(df: "pd.DataFrame") -> None:
+    st.header("📤 Portfolios")
+    st.caption(
+        "Configure portfolio sites, assign projects, and sync the generated `depot-portfolio.json` "
+        "into each site's `public/` folder. Each site fetches this file at runtime."
+    )
+
+    # ── Section 1: Portfolio Registry ──────────────────────────────────────
+    with st.expander("Portfolio Sites", expanded=True):
+        portfolios = _load_portfolios()
+
+        remove_idx = None
+        for idx, p in enumerate(portfolios):
+            c1, c2, c3, c4 = st.columns([2, 3, 2, 1])
+            p["id"] = c1.text_input(
+                "ID", value=p.get("id", ""), key=f"port_id_{idx}",
+                label_visibility="collapsed", placeholder="id (slug)"
+            )
+            p["name"] = c2.text_input(
+                "Name", value=p.get("name", ""), key=f"port_name_{idx}",
+                label_visibility="collapsed", placeholder="Display name"
+            )
+            p["path"] = c3.text_input(
+                "Path", value=p.get("path", ""), key=f"port_path_{idx}",
+                label_visibility="collapsed", placeholder="D:/Code/my-site"
+            )
+            if c4.button("✕", key=f"port_remove_{idx}", use_container_width=True, help="Remove"):
+                remove_idx = idx
+            # Output file (secondary row)
+            p["output_file"] = st.text_input(
+                "Output file (relative to site path)",
+                value=p.get("output_file", "public/depot-portfolio.json"),
+                key=f"port_output_{idx}",
+                placeholder="public/depot-portfolio.json",
+            )
+            st.markdown("---")
+
+        if remove_idx is not None:
+            portfolios.pop(remove_idx)
+            _save_portfolios(portfolios)
+            st.rerun()
+
+        if portfolios:
+            # Persist any edits made in text inputs this cycle
+            _save_portfolios(portfolios)
+
+        if st.button("+ Add portfolio site", use_container_width=True):
+            portfolios.append({"id": "", "name": "", "path": "", "output_file": "public/depot-portfolio.json"})
+            _save_portfolios(portfolios)
+            st.rerun()
+
+    portfolios = _load_portfolios()  # reload after possible edits
+
+    if not portfolios:
+        st.info("No portfolio sites configured yet. Add one above.")
+        return
+
+    # ── Section 2: Assignment Overview ─────────────────────────────────────
+    st.subheader("Assignment Overview")
+    st.caption("Which projects are assigned to each portfolio. Edit assignments in the Project → Labels editor.")
+
+    if df.empty:
+        st.info("No projects scanned yet. Run a scan first.")
+    else:
+        port_ids = [p["id"] for p in portfolios if p.get("id")]
+
+        overview_rows = []
+        view = df[df.get("user_hidden", pd.Series(dtype=int)) != 1] if "user_hidden" in df.columns else df
+        for _, row in view.iterrows():
+            try:
+                assigned = json.loads(str(row.get("user_portfolio") or "[]"))
+            except Exception:
+                assigned = []
+            entry: Dict[str, object] = {
+                "Project": str(row.get("user_display_name") or row.get("project_name") or ""),
+                "Brand": str(row.get("user_brand") or "—"),
+                "Type": str(row.get("user_type") or "—"),
+                "Status": str(row.get("user_status") or "—"),
+                "Featured": "⭐" if int(row.get("user_featured") or 0) else "",
+                "Priority": int(row.get("user_priority") or 50),
+            }
+            for pid in port_ids:
+                entry[pid] = "✓" if pid in assigned else ""
+            overview_rows.append(entry)
+
+        if overview_rows:
+            overview_df = pd.DataFrame(overview_rows)
+            st.dataframe(overview_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No visible projects found.")
+
+    # ── Section 3: Sync Controls ────────────────────────────────────────────
+    st.subheader("Sync Controls")
+
+    sync_all = st.button("🔄 Sync All Portfolios", type="primary")
+
+    for p in portfolios:
+        if not p.get("id"):
+            continue
+        pid = p["id"]
+        site_exists = Path(p.get("path", "")).exists() if p.get("path") else False
+
+        with st.container(border=True):
+            h1, h2 = st.columns([3, 1])
+            h1.markdown(f"**{p.get('name') or pid}**  \n`{p.get('path', '—')}`")
+
+            # Count assigned projects
+            if not df.empty and "user_portfolio" in df.columns:
+                def _cnt(pj: str) -> bool:
+                    try:
+                        return pid in json.loads(pj or "[]")
+                    except Exception:
+                        return False
+                count = int(df["user_portfolio"].apply(_cnt).sum())
+                hidden_count = int((df["user_hidden"] == 1).sum()) if "user_hidden" in df.columns else 0
+                h2.metric("Assigned", count)
+            else:
+                count = 0
+
+            if not site_exists:
+                st.warning(f"Path not found: `{p.get('path')}`")
+
+            with st.expander("Preview JSON output"):
+                preview_data = generate_portfolio_json(pid, df if not df.empty else pd.DataFrame())
+                st.json(preview_data)
+
+            sync_btn = st.button(
+                f"Sync → {p.get('output_file', 'public/depot-portfolio.json')}",
+                key=f"sync_{pid}",
+                disabled=not site_exists or df.empty,
+            )
+
+            if sync_btn or (sync_all and site_exists and not df.empty):
+                ok, result = write_portfolio_json(p, df)
+                if ok:
+                    st.success(f"Written to `{result}` ({count} projects)")
+                else:
+                    st.error(f"Sync failed: {result}")
 
 
 # ---------------------------------------------------------------------------
@@ -1803,6 +2392,7 @@ _NAV_TABLE = "table"
 _NAV_PROJECT = "project"
 _NAV_READMES = "readmes"
 _NAV_HIDDEN = "hidden"
+_NAV_PORTFOLIOS = "portfolios"
 
 
 def main() -> None:
@@ -1813,7 +2403,7 @@ def main() -> None:
     initialize_db(DB_PATH)
 
     with st.sidebar:
-        scan_now, roots = render_root_editor()
+        scan_now, crawl_clicked, roots = render_root_editor()
 
     df = load_projects(DB_PATH)
 
@@ -1826,6 +2416,30 @@ def main() -> None:
         st.success(f"Scan complete: {len(rows)} projects indexed.")
         df = load_projects(DB_PATH)
 
+    # Crawl & Auto-tag handler (runs crawl_and_tag.py --sync-db)
+    crawl_script = Path(__file__).with_name("crawl_and_tag.py")
+    if crawl_script.exists() and crawl_clicked:
+        with st.spinner("Crawling and tagging projects..."):
+            try:
+                proc = subprocess.run(
+                    [sys.executable, str(crawl_script), "--sync-db"],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+                out = proc.stdout + "\n" + proc.stderr if proc.stdout or proc.stderr else "(no output)"
+                if proc.returncode == 0:
+                    st.success("Crawl & Auto-tag complete.")
+                    st.code(out, language="text")
+                    df = load_projects(DB_PATH)
+                else:
+                    st.error("Crawl & Auto-tag failed.")
+                    st.code(out, language="text")
+            except subprocess.TimeoutExpired:
+                st.error("Crawl & Auto-tag timed out (5 min).")
+            except Exception as exc:
+                st.error(f"Crawl & Auto-tag error: {exc}")
+
     if "active_tab" not in st.session_state:
         st.session_state["active_tab"] = _NAV_TABLE
 
@@ -1835,7 +2449,7 @@ def main() -> None:
     selected_path = st.session_state.get("selected_project_path")
     proj_label = f"🔍 {Path(selected_path).name}" if selected_path else "🔍 Project"
 
-    n1, n2, n3, n4 = st.columns(4)
+    n1, n2, n3, n4, n5 = st.columns(5)
     if n1.button(
         "📋 Table", use_container_width=True,
         type="primary" if active == _NAV_TABLE else "secondary",
@@ -1859,6 +2473,12 @@ def main() -> None:
         type="primary" if active == _NAV_HIDDEN else "secondary",
     ):
         st.session_state["active_tab"] = _NAV_HIDDEN
+        st.rerun()
+    if n5.button(
+        "📤 Portfolios", use_container_width=True,
+        type="primary" if active == _NAV_PORTFOLIOS else "secondary",
+    ):
+        st.session_state["active_tab"] = _NAV_PORTFOLIOS
         st.rerun()
 
     st.markdown("---")
@@ -1896,16 +2516,122 @@ def main() -> None:
             st.rerun()
 
         selected = df[df["project_path"] == chosen_path].iloc[0]
+        project_path = str(selected["project_path"])
 
         # Quick action bar
-        qa1, qa2, qa3 = st.columns([1, 1, 5])
-        if qa1.button("📂 Open in Explorer", use_container_width=True, key="open_proj_explorer"):
-            open_in_explorer(str(selected["project_path"]))
+        qa1, qa2 = st.columns([1, 1])
+        if qa1.button("📂 Open folder", use_container_width=True, key="open_proj_explorer"):
+            open_in_explorer(project_path)
         if qa2.button("📂 Open root", use_container_width=True, key="open_root_explorer"):
             open_in_explorer(str(selected["source_root"]))
 
-        # Per-project metadata editor (above sub-tabs so it's always accessible)
-        render_user_meta_editor(str(selected["project_path"]), DB_PATH)
+        # ── Metadata status bar — always visible ─────────────────────────────
+        meta_file = Path(project_path) / REPO_META_FILENAME
+        file_exists = meta_file.exists()
+        db_has_data = _has_meaningful_meta(selected)
+        confirm_reset_key = f"confirm_reset::{project_path}"
+
+        with st.container(border=True):
+            if not file_exists and db_has_data:
+                # ⚠️ STALE: file gone, DB still has labels → will be wiped on next rescan
+                st.warning(
+                    f"**`.repo-meta.json` was deleted** but this project still has labels in the "
+                    f"database. They will be wiped on the next full rescan.",
+                    icon="⚠️",
+                )
+                sb1, sb2, sb3 = st.columns([2, 2, 3])
+                if sb1.button("Recreate file from DB", key="recreate_meta_file", use_container_width=True,
+                              help="Write current DB labels back to .repo-meta.json"):
+                    ok = write_repo_meta(project_path, _row_to_meta_dict(selected))
+                    if ok:
+                        st.success(f"`.repo-meta.json` recreated.")
+                        st.rerun()
+                if sb2.button("Reset DB to defaults", key="reset_meta_stale", use_container_width=True,
+                              type="primary", help="Clear stale labels from the database"):
+                    st.session_state[confirm_reset_key] = True
+
+            elif file_exists and db_has_data:
+                # ✅ NORMAL: file and DB both have labels
+                sb1, sb2, sb3 = st.columns([3, 1, 1])
+                label_count = sum([
+                    bool(str(selected.get("user_description", ""))),
+                    bool(str(selected.get("user_brand", ""))),
+                    str(selected.get("user_portfolio", "[]")) not in ("[]", ""),
+                    str(selected.get("user_status", "")) != "",
+                ])
+                sb1.caption(f"🏷️  `.repo-meta.json` present — {label_count} key fields set")
+                if sb2.button("🔄 Reload", key="reload_meta_from_file", use_container_width=True,
+                              help="Re-read .repo-meta.json and update the database (use after manual file edits)"):
+                    ok, msg = sync_meta_from_file(project_path, DB_PATH)
+                    if ok:
+                        st.success("Database updated from file.")
+                        st.rerun()
+                    else:
+                        st.error(msg)
+                if sb3.button("🗑️ Reset", key="reset_meta_labeled", use_container_width=True,
+                              help="Delete .repo-meta.json and clear all labels from the database"):
+                    st.session_state[confirm_reset_key] = True
+
+            elif file_exists and not db_has_data:
+                # File exists but DB is empty — can happen if file was added manually
+                sb1, sb2 = st.columns([3, 1])
+                sb1.caption("🏷️  `.repo-meta.json` found — not yet synced to database")
+                if sb2.button("🔄 Sync to DB", key="sync_meta_to_db_btn", use_container_width=True):
+                    ok, msg = sync_meta_from_file(project_path, DB_PATH)
+                    if ok:
+                        st.success("Synced.")
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+            else:
+                # Clean: no file, no DB data
+                st.caption("No labels yet — expand **Labels & Notes** below to add them.")
+
+            # ── Reset confirmation — inline, prominent ────────────────────────
+            if st.session_state.get(confirm_reset_key):
+                try:
+                    affected = json.loads(str(selected.get("user_portfolio") or "[]"))
+                except Exception:
+                    affected = []
+                port_note = (
+                    f" Project is assigned to **{len(affected)} portfolio(s)** — "
+                    f"those will be re-synced automatically."
+                ) if affected else ""
+
+                st.error(
+                    f"**This will permanently delete `.repo-meta.json`** (if it exists) and clear "
+                    f"all labels from the database.{port_note}  \nThis cannot be undone.",
+                )
+                rc1, rc2, rc3 = st.columns([2, 2, 4])
+                if rc1.button("Yes, reset everything", key=f"reset_confirm_yes::{project_path}",
+                              type="primary", use_container_width=True):
+                    ok, err = delete_repo_meta(project_path, DB_PATH)
+                    if ok:
+                        resync_msg = ""
+                        if affected:
+                            fresh_df = load_projects(DB_PATH)
+                            portfolios_cfg = _load_portfolios()
+                            resynced = []
+                            for pid in affected:
+                                port = next((p for p in portfolios_cfg if p.get("id") == pid), None)
+                                if port and Path(port.get("path", "")).exists():
+                                    w_ok, _ = write_portfolio_json(port, fresh_df)
+                                    if w_ok:
+                                        resynced.append(pid)
+                            if resynced:
+                                resync_msg = f"  Resynced portfolios: {', '.join(resynced)}."
+                        st.success(f"Reset complete.{resync_msg}")
+                    else:
+                        st.error(f"Reset failed: {err}")
+                    st.session_state.pop(confirm_reset_key, None)
+                    st.rerun()
+                if rc2.button("Cancel", key=f"reset_confirm_no::{project_path}", use_container_width=True):
+                    st.session_state.pop(confirm_reset_key, None)
+                    st.rerun()
+
+        # ── Labels editor (expander, for editing fields) ─────────────────────
+        render_user_meta_editor(project_path, DB_PATH)
 
         # Drilldown sub-tabs (st.tabs is fine here — no programmatic switching needed)
         t_files, t_pkg, t_readme, t_git, t_info = st.tabs([
@@ -1943,7 +2669,11 @@ def main() -> None:
             if combined.empty:
                 st.info("No hidden or archived projects. Mark projects as hidden or archived using the 🏷️ Labels & Notes editor in the Project view.")
             else:
-                render_inventory(combined, meta_filters={"show_hidden": True, "statuses": [], "tags": []})
+                render_inventory(combined, meta_filters={"show_hidden": True, "statuses": [], "tags": [], "brands": [], "types": []})
+
+    # --- Portfolios ---
+    elif active == _NAV_PORTFOLIOS:
+        render_portfolios_page(df)
 
 
 if __name__ == "__main__":
